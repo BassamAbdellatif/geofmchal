@@ -331,13 +331,163 @@ class EfficientDecoder256Fast(nn.Module):
         return self.head(x)
 
 
+class AttentionGate(nn.Module):
+    def __init__(self, F_g, F_x, F_int):
+        """
+        F_g: gating signal channels (from decoder)
+        F_x: skip connection channels (from encoder)
+        F_int: intermediate representation channels
+        """
+        super().__init__()
+        self.W_g = nn.Sequential(
+            nn.Conv2d(F_g, F_int, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(F_int)
+        )
+        self.W_x = nn.Sequential(
+            nn.Conv2d(F_x, F_int, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(F_int)
+        )
+        self.psi = nn.Sequential(
+            nn.Conv2d(F_int, 1, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(1)
+        )
+        self.relu = nn.ReLU(inplace=True)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x, g):
+        g1 = self.W_g(g)
+        x1 = self.W_x(x)
+        
+        # Align spatial dimensions of gating signal to skip connection if they differ
+        if g1.shape[-2:] != x1.shape[-2:]:
+            g1 = F.interpolate(g1, size=x1.shape[-2:], mode='bilinear', align_corners=True)
+
+        psi = self.relu(g1 + x1)
+        psi = self.psi(psi)
+        alpha = self.sigmoid(psi)
+        return x * alpha
+
+
+class ResidualConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.act = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+
+        self.shortcut = nn.Sequential()
+        if in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
+
+    def forward(self, x):
+        out = self.act(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        return self.act(out)
+
+
+class AttentionFusedDecoder(nn.Module):
+    def __init__(self, pixel_channels=128, patch_channels=768, out_channels=4):
+        super().__init__()
+
+        # --- ENCODER (128 -> 64 -> 128 -> 256 -> 512) ---
+        self.inc = DoubleConv(pixel_channels, 64)
+        self.down1 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(64, 128))
+        self.down2 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(128, 256))
+        self.down3 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(256, 512))
+        
+        # MaxPool to obtain 16x16 resolution bottleneck features from the encoder
+        self.down4_pool = nn.MaxPool2d(2)
+
+        # --- BOTTLENECK FUSION ---
+        # Concatenate 512 (encoder bottleneck) + 768 (patch embedding) = 1280 channels
+        # Pass this combined tensor through a convolution to reduce channel dimensions to 512.
+        self.fusion_conv = nn.Sequential(
+            nn.Conv2d(512 + patch_channels, 512, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True)
+        )
+
+        # --- DECODER with Attention Gated Skip Connections ---
+        # Step 1: 16x16 -> 32x32.
+        self.up1 = StandardUpsampleBlock(512, 256)
+        self.att1 = AttentionGate(F_g=256, F_x=512, F_int=256)
+        self.dec_conv1 = ResidualConvBlock(768, 256)
+
+        # Step 2: 32x32 -> 64x64.
+        self.up2 = StandardUpsampleBlock(256, 128)
+        self.att2 = AttentionGate(F_g=128, F_x=256, F_int=128)
+        self.dec_conv2 = ResidualConvBlock(384, 128)
+
+        # Step 3: 64x64 -> 128x128.
+        self.up3 = StandardUpsampleBlock(128, 64)
+        self.att3 = AttentionGate(F_g=64, F_x=128, F_int=64)
+        self.dec_conv3 = ResidualConvBlock(192, 64)
+
+        # Step 4: 128x128 -> 256x256.
+        self.up4 = StandardUpsampleBlock(64, 32)
+        self.att4 = AttentionGate(F_g=32, F_x=64, F_int=32)
+        self.dec_conv4 = ResidualConvBlock(96, 32)
+
+        # --- OUTPUT HEAD ---
+        self.head = nn.Conv2d(32, out_channels, kernel_size=1)
+
+    def forward(self, pixel_emb, patch_emb):
+        # 1. Encoder forward pass
+        x1 = self.inc(pixel_emb)                # [B, 64, 256, 256]
+        x2 = self.down1(x1)                     # [B, 128, 128, 128]
+        x3 = self.down2(x2)                     # [B, 256, 64, 64]
+        x4 = self.down3(x3)                     # [B, 512, 32, 32]
+        
+        # Encoder bottleneck representation at 16x16
+        enc_bottleneck = self.down4_pool(x4)    # [B, 512, 16, 16]
+
+        # 2. Bottleneck Fusion
+        fused = torch.cat([enc_bottleneck, patch_emb], dim=1)  # [B, 512+768, 16, 16]
+        fused = self.fusion_conv(fused)                        # [B, 512, 16, 16]
+
+        # 3. Decoder with Attention-Gated skip connections
+        # Stage 1: 16x16 -> 32x32
+        d1 = self.up1(fused)                    # [B, 256, 32, 32]
+        gated_x4 = self.att1(x4, d1)            # [B, 512, 32, 32]
+        d1 = torch.cat([d1, gated_x4], dim=1)   # [B, 768, 32, 32]
+        d1 = self.dec_conv1(d1)                 # [B, 256, 32, 32]
+
+        # Stage 2: 32x32 -> 64x64
+        d2 = self.up2(d1)                       # [B, 128, 64, 64]
+        gated_x3 = self.att2(x3, d2)            # [B, 256, 64, 64]
+        d2 = torch.cat([d2, gated_x3], dim=1)   # [B, 384, 64, 64]
+        d2 = self.dec_conv2(d2)                 # [B, 128, 64, 64]
+
+        # Stage 3: 64x64 -> 128x128
+        d3 = self.up3(d2)                       # [B, 64, 128, 128]
+        gated_x2 = self.att3(x2, d3)            # [B, 128, 128, 128]
+        d3 = torch.cat([d3, gated_x2], dim=1)   # [B, 192, 128, 128]
+        d3 = self.dec_conv3(d3)                 # [B, 64, 128, 128]
+
+        # Stage 4: 128x128 -> 256x256
+        d4 = self.up4(d3)                       # [B, 32, 256, 256]
+        gated_x1 = self.att4(x1, d4)            # [B, 64, 256, 256]
+        d4 = torch.cat([d4, gated_x1], dim=1)   # [B, 96, 256, 256]
+        d4 = self.dec_conv4(d4)                 # [B, 32, 256, 256]
+
+        # Output head
+        logits = self.head(d4)                  # [B, 4, 256, 256]
+        return logits
+
+
 def infer_model_type(n_channels):
     if n_channels == 768:
         return "decoder_residual"
     return "lightunet"
 
 
-def build_model(model_type, n_channels, n_classes):
+def build_model(model_type, n_channels, n_classes, pixel_channels=128, patch_channels=768):
     selected = model_type.lower()
 
     if selected == "auto":
@@ -346,7 +496,9 @@ def build_model(model_type, n_channels, n_classes):
         return LightUNet(n_channels, n_classes), selected
     if selected == "decoder_residual":
         return EfficientDecoder256Fast(in_channels=n_channels, out_channels=n_classes), selected
+    if selected == "attention_fusion":
+        return AttentionFusedDecoder(pixel_channels=pixel_channels, patch_channels=patch_channels, out_channels=n_classes), selected
 
     raise ValueError(
-        f"Unknown model_type '{model_type}'. Use one of: auto, lightunet, only_decoder, decoder_residual"
+        f"Unknown model_type '{model_type}'. Use one of: auto, lightunet, only_decoder, decoder_residual, attention_fusion"
     )
