@@ -1,3 +1,4 @@
+import config
 import os
 import random
 import argparse
@@ -28,13 +29,12 @@ LOSS_CURVE_PATH = os.path.join(EXP_DIR, "loss_curve.png")
 CONFIG_LOG_PATH = os.path.join(EXP_DIR, "training_params.txt")
 
 # --- 2. CONFIGURATION ---
-# TRAIN_EMBEDDINGS_DIR = "../../emb2heights/data/gee_emb_aligned_v2/"
 
-TRAIN_EMBEDDINGS_DIR = "../../emb2heights/data/gee_emb_aligned_v2"
-TRAIN_TARGETS_DIR = "../../emb2heights/data/patches_labels_10m/"
+TRAIN_EMBEDDINGS_DIR = None
+TRAIN_TARGETS_DIR = None
 
-BATCH_SIZE = 32
-PATCH_SIZE = 256
+BATCH_SIZE = config.BATCH_SIZE
+PATCH_SIZE = config.PATCH_SIZE
 EPOCHS = 30
 LEARNING_RATE = 2e-4
 WEIGHT_DECAY = 1e-4  # L2 Regularization
@@ -83,8 +83,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train emb2heights baseline models")
     parser.add_argument("--model-type", type=str, default=MODEL_TYPE, choices=["auto", "lightunet", "decoder_residual"])
     parser.add_argument("--output-dir", type=str, default=BASE_DIR)
-    parser.add_argument("--train-embeddings-dir", type=str, default=TRAIN_EMBEDDINGS_DIR)
-    parser.add_argument("--train-targets-dir", type=str, default=TRAIN_TARGETS_DIR)
+    parser.add_argument("--train-embeddings-dir", type=str, default=None, help="Path to training embeddings. Defaults to path in config.py based on model-type.")
+    parser.add_argument("--train-targets-dir", type=str, default=None, help="Path to training targets. Defaults to path in config.py.")
     parser.add_argument("--experiment-name", type=str, default=EXPERIMENT_NAME)
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     parser.add_argument("--patch-size", type=int, default=PATCH_SIZE)
@@ -140,12 +140,25 @@ def main():
     args = parse_args()
     MODEL_TYPE = args.model_type
     BASE_DIR = args.output_dir
-    TRAIN_EMBEDDINGS_DIR = args.train_embeddings_dir
-    TRAIN_TARGETS_DIR = args.train_targets_dir
     EXPERIMENT_NAME = args.experiment_name
     BATCH_SIZE = args.batch_size
     PATCH_SIZE = args.patch_size
     EPOCHS = args.epochs
+
+    # Resolve directories using config.py
+    if args.train_embeddings_dir is None:
+        if MODEL_TYPE == "lightunet":
+            TRAIN_EMBEDDINGS_DIR = config.TESSERA_DIR
+        else:
+            # For decoder_residual and auto defaults
+            TRAIN_EMBEDDINGS_DIR = config.TERRAMIND_S1_DIR
+    else:
+        TRAIN_EMBEDDINGS_DIR = args.train_embeddings_dir
+
+    if args.train_targets_dir is None:
+        TRAIN_TARGETS_DIR = config.LABELS_DIR
+    else:
+        TRAIN_TARGETS_DIR = args.train_targets_dir
 
     EXP_DIR = os.path.join(BASE_DIR, EXPERIMENT_NAME)
     VIZ_OUTPUT_DIR = os.path.join(EXP_DIR, "visualizations")

@@ -331,6 +331,12 @@ class EfficientDecoder256Fast(nn.Module):
         return self.head(x)
 
 
+def infer_model_type(n_channels):
+    if n_channels == 768:
+        return "decoder_residual"
+    return "lightunet"
+
+
 def build_model(model_type, n_channels, n_classes):
     selected = model_type.lower()
 
