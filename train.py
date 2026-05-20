@@ -328,7 +328,7 @@ def main():
     print(f"Starting training on {DEVICE}...")
 
     train_losses, val_losses = [], []
-    best_val_loss = float('inf')
+    best_val_score = float('inf')
     epoch_times = []
     total_start_time = time.time()
 
@@ -407,10 +407,14 @@ def main():
 
         scheduler.step(epoch_val_loss)
 
-        if epoch_val_loss < best_val_loss:
-            best_val_loss = epoch_val_loss
+        val_mae = epoch_comp[0].item()
+        val_tversky = epoch_comp[3].item()
+        val_score = val_mae + (val_tversky * 2.0)
+
+        if val_score < best_val_score:
+            best_val_score = val_score
             torch.save(model.state_dict(), BEST_MODEL_PATH)
-            print(f"   >> Model Saved! (New Best Val Loss: {best_val_loss:.4f})")
+            print(f"   >> [Checkpoint] New best model saved! (Score: {val_score:.4f} | MAE: {val_mae:.4f} | Tversky: {val_tversky:.4f})")
 
         epoch_elapsed = time.time() - epoch_start_time
         epoch_times.append(epoch_elapsed)
