@@ -139,14 +139,17 @@ def parse_args():
 
 def calc_leaderboard_metrics(preds, targets):
     """Calculate continuous Soft IoU and Masked RMSE (in physical meters)."""
+    # Bound Abundance logits between 0 and 1
+    preds_abund = torch.sigmoid(preds[:, :3])
+    
     def soft_iou(p, t):
         intersection = (p * t).sum()
         union = (p + t - (p * t)).sum()
         return (intersection / (union + 1e-8)).item()
 
-    iou_build = soft_iou(preds[:, 0], targets[:, 0])
-    iou_veg = soft_iou(preds[:, 1], targets[:, 1])
-    iou_water = soft_iou(preds[:, 2], targets[:, 2])
+    iou_build = soft_iou(preds_abund[:, 0], targets[:, 0])
+    iou_veg = soft_iou(preds_abund[:, 1], targets[:, 1])
+    iou_water = soft_iou(preds_abund[:, 2], targets[:, 2])
 
     def masked_rmse(p_height, t_height, mask):
         if mask.sum() == 0:
@@ -156,6 +159,7 @@ def calc_leaderboard_metrics(preds, targets):
         return torch.sqrt(((p_h - t_h) ** 2).mean()).item()
 
     mask_build = targets[:, 0] > 0.1
+    # Channel 3 is kept linear/untouched for Masked RMSE
     rmse_h_build = masked_rmse(preds[:, 3], targets[:, 3], mask_build)
 
     mask_veg = targets[:, 1] > 0.1
@@ -356,6 +360,8 @@ def main():
 
     train_losses, val_losses = [], []
     best_val_score = float('inf')
+    best_epoch = 0
+    best_metrics = None
     epoch_times = []
     total_start_time = time.time()
 
@@ -451,6 +457,8 @@ def main():
 
         if val_score < best_val_score:
             best_val_score = val_score
+            best_epoch = epoch + 1
+            best_metrics = epoch_metrics
             torch.save(model.state_dict(), BEST_MODEL_PATH)
             print(f"   >> [Checkpoint] New best model saved! (Score: {val_score:.4f} | MAE: {val_mae:.4f} | Tversky: {val_tversky:.4f})")
 
@@ -465,8 +473,9 @@ def main():
         print(f"   >> Leaderboard: IOU_B: {epoch_metrics[0]:.4f} | IOU_V: {epoch_metrics[1]:.4f} | IOU_W: {epoch_metrics[2]:.4f} | RMSE_H_B: {epoch_metrics[3]:.4f} | RMSE_H_V: {epoch_metrics[4]:.4f}")
 
         # Append epoch time to params log file
+        current_lr = optimizer.param_groups[0]['lr']
         with open(CONFIG_LOG_PATH, "a") as f:
-            f.write(f"Epoch {epoch + 1} finished in {epoch_elapsed:.2f}s ({epoch_elapsed/60:.2f}m) | Train Loss: {epoch_loss:.4f} | Val Loss: {epoch_val_loss:.4f}\n")
+            f.write(f"Epoch {epoch + 1} finished in {epoch_elapsed:.2f}s | Train Loss: {epoch_loss:.4f} | Val Loss: {epoch_val_loss:.4f} | LR: {current_lr:.6f} | IOU_B: {epoch_metrics[0]:.4f} | IOU_V: {epoch_metrics[1]:.4f} | IOU_W: {epoch_metrics[2]:.4f} | RMSE_B: {epoch_metrics[3]:.4f} | RMSE_V: {epoch_metrics[4]:.4f}\n")
 
         # Clean memory to avoid leaks/fragmentation across epochs
         import gc
@@ -474,17 +483,18 @@ def main():
         torch.cuda.empty_cache()
 
     total_elapsed = time.time() - total_start_time
-    total_time_msg = (
-        f"\n=== TRAINING REPORT ===\n"
-        f"Total Training Time: {total_elapsed:.2f} seconds ({total_elapsed/60:.2f} minutes)\n"
-    )
-    for i, t in enumerate(epoch_times):
-        total_time_msg += f"   >> Epoch {i+1}: {t:.2f}s ({t/60:.2f}m)\n"
-    total_time_msg += "=======================\n"
-    print(total_time_msg, end="")
     
-    with open(CONFIG_LOG_PATH, "a") as f:
-        f.write(total_time_msg)
+    # Add Best Model Summary block
+    if best_metrics is not None:
+        summary_msg = (
+            f"\n=== BEST MODEL SUMMARY ===\n"
+            f"Best Epoch: {best_epoch}\n"
+            f"Best Val Score (Tversky + 2*MAE): {best_val_score:.4f}\n"
+            f"Leaderboard Metrics at Best Epoch -> IOU_B: {best_metrics[0]:.4f} | IOU_V: {best_metrics[1]:.4f} | IOU_W: {best_metrics[2]:.4f} | RMSE_B: {best_metrics[3]:.4f} | RMSE_V: {best_metrics[4]:.4f}\n"
+        )
+        print(summary_msg, end="")
+        with open(CONFIG_LOG_PATH, "a") as f:
+            f.write(summary_msg)
 
     print("--- 3. Saving & Visualizing ---")
     torch.save(model.state_dict(), LAST_MODEL_PATH)
