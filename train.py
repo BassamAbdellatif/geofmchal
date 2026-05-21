@@ -137,6 +137,33 @@ def parse_args():
     return parser.parse_args()
 
 
+def calc_leaderboard_metrics(preds, targets):
+    """Calculate continuous Soft IoU and Masked RMSE (in physical meters)."""
+    def soft_iou(p, t):
+        intersection = (p * t).sum()
+        union = (p + t - (p * t)).sum()
+        return (intersection / (union + 1e-8)).item()
+
+    iou_build = soft_iou(preds[:, 0], targets[:, 0])
+    iou_veg = soft_iou(preds[:, 1], targets[:, 1])
+    iou_water = soft_iou(preds[:, 2], targets[:, 2])
+
+    def masked_rmse(p_height, t_height, mask):
+        if mask.sum() == 0:
+            return 0.0
+        p_h = p_height[mask] * HEIGHT_NORM_CONSTANT
+        t_h = t_height[mask] * HEIGHT_NORM_CONSTANT
+        return torch.sqrt(((p_h - t_h) ** 2).mean()).item()
+
+    mask_build = targets[:, 0] > 0.1
+    rmse_h_build = masked_rmse(preds[:, 3], targets[:, 3], mask_build)
+
+    mask_veg = targets[:, 1] > 0.1
+    rmse_h_veg = masked_rmse(preds[:, 3], targets[:, 3], mask_veg)
+
+    return iou_build, iou_veg, iou_water, rmse_h_build, rmse_h_veg
+
+
 def align_target_to_output(target, output):
     if target.shape[-2:] != output.shape[-2:]:
         return F.interpolate(target, size=output.shape[-2:], mode='bilinear', align_corners=False)
@@ -373,6 +400,7 @@ def main():
         model.eval()
         val_running_loss = 0.0
         val_components = torch.zeros(4).to(DEVICE)
+        val_metrics = torch.zeros(5).to(DEVICE)
         val_samples_seen = 0
 
         with torch.no_grad():
@@ -397,12 +425,22 @@ def main():
                 val_components[1] += l_ssim * batch_size
                 val_components[2] += l_grad * batch_size
                 val_components[3] += l_tversky * batch_size
+                
+                # Leaderboard metrics
+                m_iou_b, m_iou_v, m_iou_w, m_rmse_b, m_rmse_v = calc_leaderboard_metrics(outputs, targets)
+                val_metrics[0] += m_iou_b * batch_size
+                val_metrics[1] += m_iou_v * batch_size
+                val_metrics[2] += m_iou_w * batch_size
+                val_metrics[3] += m_rmse_b * batch_size
+                val_metrics[4] += m_rmse_v * batch_size
+                
                 val_samples_seen += batch_size
                 val_avg_live = val_running_loss / max(1, val_samples_seen)
                 val_pbar.set_postfix(avg=f"{val_avg_live:.4f}")
 
         epoch_val_loss = val_running_loss / len(val_ds)
         epoch_comp = val_components / len(val_ds)
+        epoch_metrics = val_metrics / len(val_ds)
         val_losses.append(epoch_val_loss)
 
         scheduler.step(epoch_val_loss)
@@ -424,6 +462,7 @@ def main():
         print(epoch_time_msg, end="")
         print(
             f"   >> Val Breakdown: MAE:{epoch_comp[0]:.3f} | SSIM:{epoch_comp[1]:.3f} | Grad:{epoch_comp[2]:.3f} | Tversky:{epoch_comp[3]:.3f}")
+        print(f"   >> Leaderboard: IOU_B: {epoch_metrics[0]:.4f} | IOU_V: {epoch_metrics[1]:.4f} | IOU_W: {epoch_metrics[2]:.4f} | RMSE_H_B: {epoch_metrics[3]:.4f} | RMSE_H_V: {epoch_metrics[4]:.4f}")
 
         # Append epoch time to params log file
         with open(CONFIG_LOG_PATH, "a") as f:

@@ -1,5 +1,6 @@
 import os
 import socket
+import multiprocessing
 
 # Raise file descriptor limit dynamically to prevent "Too many open files" errors
 try:
@@ -21,9 +22,16 @@ os.environ["GDAL_SHARED_FILE_LIMIT"] = "50"
 
 from dataclasses import dataclass
 
-LOCAL_DATA_ROOT = "/scratch/geofm_data"
-SHARED_DATA_ROOT = "/mnt/shared/geofm_data"
-SHARED_RUNS_DIR = "/mnt/shared/geofm_data/runs"
+# Define the shared master path for outputs
+SHARED_DATA_ROOT = "/mnt/head/users/bassam/data/geofmdata"
+SHARED_RUNS_DIR = os.path.join(SHARED_DATA_ROOT, "runs")
+
+# Define EVERY possible local path across your cluster
+LOCAL_PATHS = [
+    "/mnt/n1/users/bassam/data/geofmdata",
+    "/mnt/n2/users/bassam/data/geofmdata",
+    "/mnt/n3/users/bassam/data/geofmdata",
+    "/mnt/head/users/bassam/data/geofmdata" 
 
 if not os.path.exists(SHARED_RUNS_DIR):
     try:
@@ -31,29 +39,42 @@ if not os.path.exists(SHARED_RUNS_DIR):
     except Exception:
         pass
 
-if os.path.exists(LOCAL_DATA_ROOT):
-    TARGET_DRIVE = LOCAL_DATA_ROOT
-    print(f"[{socket.gethostname()}] Success: Routing data to fast local NVMe -> {TARGET_DRIVE}")
-else:
-    TARGET_DRIVE = SHARED_DATA_ROOT
-    print(f"[{socket.gethostname()}] Warning: Local NVMe not found. Routing data to shared NFS -> {TARGET_DRIVE}")
+# The Auto-Router: Find the path that exists on THIS specific machine
+TARGET_DRIVE = SHARED_DATA_ROOT  # Default to the slow shared drive just in case
+is_fast_local = False
+
+for path in LOCAL_PATHS:
+    if os.path.exists(path):
+        TARGET_DRIVE = path
+        is_fast_local = True
+        break
+
+if multiprocessing.current_process().name == 'MainProcess':
+    if is_fast_local:
+        print(f"⚡ [{socket.gethostname()}] Fast data path selected: {TARGET_DRIVE}")
+    else:
+        print(f"⚠️ [{socket.gethostname()}] Local cache missing. Falling back to slow NFS: {TARGET_DRIVE}")
+
+# Now build your embedding directories based on whatever TARGET_DRIVE became
+# Ensuring we include the /data/ intermediate folder to match our architecture
+BASE_EMB_DIR = os.path.join(TARGET_DRIVE, "embed2heights", "data")
 
 # Paths to training data subdirectories
-ALPHA_EARTH_DIR = os.path.join(TARGET_DRIVE, "train", "alphaearth_emb")
-TESSERA_DIR = os.path.join(TARGET_DRIVE, "train", "tessera_emb")
-TERRAMIND_S1_DIR = os.path.join(TARGET_DRIVE, "train", "terramind_s1_emb")
-TERRAMIND_S2_DIR = os.path.join(TARGET_DRIVE, "train", "terramind_s2_emb")
-THOR_S1_DIR = os.path.join(TARGET_DRIVE, "train", "thor_s1_emb")
-THOR_S2_DIR = os.path.join(TARGET_DRIVE, "train", "thor_s2_emb")
-LABELS_DIR = os.path.join(TARGET_DRIVE, "train", "labels")
+ALPHA_EARTH_DIR = os.path.join(BASE_EMB_DIR, "train", "alphaearth_emb")
+TESSERA_DIR = os.path.join(BASE_EMB_DIR, "train", "tessera_emb")
+TERRAMIND_S1_DIR = os.path.join(BASE_EMB_DIR, "train", "terramind_s1_emb")
+TERRAMIND_S2_DIR = os.path.join(BASE_EMB_DIR, "train", "terramind_s2_emb")
+THOR_S1_DIR = os.path.join(BASE_EMB_DIR, "train", "thor_s1_emb")
+THOR_S2_DIR = os.path.join(BASE_EMB_DIR, "train", "thor_s2_emb")
+LABELS_DIR = os.path.join(BASE_EMB_DIR, "train", "labels")
 
 # Paths to test data subdirectories (for cleaner predict command lines)
-ALPHA_EARTH_TEST_DIR = os.path.join(TARGET_DRIVE, "test", "alphaearth_test_emb")
-TESSERA_TEST_DIR = os.path.join(TARGET_DRIVE, "test", "tessera_test_emb")
-TERRAMIND_S1_TEST_DIR = os.path.join(TARGET_DRIVE, "test", "terramind_test_s1_emb")
-TERRAMIND_S2_TEST_DIR = os.path.join(TARGET_DRIVE, "test", "terramind_test_s2_emb")
-THOR_S1_TEST_DIR = os.path.join(TARGET_DRIVE, "test", "thor_test_s1_emb")
-THOR_S2_TEST_DIR = os.path.join(TARGET_DRIVE, "test", "thor_test_s2_emb")
+ALPHA_EARTH_TEST_DIR = os.path.join(BASE_EMB_DIR, "test", "alphaearth_test_emb")
+TESSERA_TEST_DIR = os.path.join(BASE_EMB_DIR, "test", "tessera_test_emb")
+TERRAMIND_S1_TEST_DIR = os.path.join(BASE_EMB_DIR, "test", "terramind_test_s1_emb")
+TERRAMIND_S2_TEST_DIR = os.path.join(BASE_EMB_DIR, "test", "terramind_test_s2_emb")
+THOR_S1_TEST_DIR = os.path.join(BASE_EMB_DIR, "test", "thor_test_s1_emb")
+THOR_S2_TEST_DIR = os.path.join(BASE_EMB_DIR, "test", "thor_test_s2_emb")
 
 # Default Hyperparameters
 PATCH_SIZE = 256
