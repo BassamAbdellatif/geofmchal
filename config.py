@@ -32,6 +32,7 @@ LOCAL_PATHS = [
     "/mnt/n2/users/bassam/data/geofmdata",
     "/mnt/n3/users/bassam/data/geofmdata",
     "/mnt/head/users/bassam/data/geofmdata" 
+]
 
 if not os.path.exists(SHARED_RUNS_DIR):
     try:
