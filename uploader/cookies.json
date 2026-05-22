@@ -1,0 +1,58 @@
+[
+    {
+        "domain": ".esa.int",
+        "expirationDate": 1814047687.958785,
+        "hostOnly": false,
+        "httpOnly": false,
+        "name": "_ga",
+        "path": "/",
+        "sameSite": "unspecified",
+        "secure": false,
+        "session": false,
+        "storeId": "0",
+        "value": "GA1.1.1957751301.1778884538",
+        "id": 1
+    },
+    {
+        "domain": ".esa.int",
+        "expirationDate": 1814047687.95836,
+        "hostOnly": false,
+        "httpOnly": false,
+        "name": "_ga_N5NDQ5J59N",
+        "path": "/",
+        "sameSite": "unspecified",
+        "secure": false,
+        "session": false,
+        "storeId": "0",
+        "value": "GS2.1.s1779487634$o8$g1$t1779487687$j7$l0$h0",
+        "id": 2
+    },
+    {
+        "domain": ".esa.int",
+        "expirationDate": 1813526801.358941,
+        "hostOnly": false,
+        "httpOnly": false,
+        "name": "_ga_ZHJ78LLCSD",
+        "path": "/",
+        "sameSite": "unspecified",
+        "secure": false,
+        "session": false,
+        "storeId": "0",
+        "value": "GS2.1.s1778966801$o2$g0$t1778966801$j60$l0$h0",
+        "id": 3
+    },
+    {
+        "domain": "platform-challenges.philab.esa.int",
+        "expirationDate": 1780697240.40557,
+        "hostOnly": true,
+        "httpOnly": true,
+        "name": "logtoCookies",
+        "path": "/",
+        "sameSite": "lax",
+        "secure": true,
+        "session": false,
+        "storeId": "0",
+        "value": "Tw4nMuWpZ3aA1bfttZ5DBJOUQcDEi4E64gO%2FxhMLHH05%2F9e8vO85rMcf0g03C2EXbWYsEzQC5ymBZEizOBsNtotXbH8XQAlLxn97Zifhbehig8NbTfUvk%2Flrm1wqUCBrvaxXEC3Uj3aPEaPfTrsizIuZcH3%2FaOSM7tVaJCrWJx8Wd%2FfBwdL24Wn1i4%2BW1UjzDYV3LG9cZnQclnTWPXbFzGRO84ZjYc52m3mjhVefe4vG%2BOOhpq7QZ3PFibHsvba2zHNQ0nZGAZ%2FUDwolbINY75T%2FUNhgTXM4ihtD9KZ2ckyJnatvkkKlvW5qMwaeGU0E4qS3HJdN7xxKzCkW44Nr%2BFsQ7%2FJshQLqI3IAdaySjxkzB99V1A0oBj1Yt5ZTEbbLVMouAKwt%2B836leo76G4JRDWDAE4ziHkCX9JGZ3R1uWYxx6URNdJjGGX59s9mrqq9Z99JPF0O8efkdM%2B9NTtG50vJm%2Ba79COXsY7BWyotE6TuedjFAh7ChcG5tReNBQOC66VMDYlh%2FGEGYDuD8hczDxPvhfjQbpRc%2Fzv%2FO2cFT2sf9Q5Ocft6Z0nV4CZS1GSWg1%2FS5WYhYwqQApVcWSwTBoQQNMyUUYCkWYnQ2V8ueNTLJYbqjxTQWN564GP5o%2FHYSAW1iSZ5TGtUEMTsJzkoImoKfSgVkWLWFqSbcHvf2jlPp%2FREDK30VE1plTY8zWuJCS6BXOKiw9N3nLOG1DTmk6dI2P9Ju10haJ8BjCbQ9QEVV9O%2BsGfmsy7qc6%2FbxfQeZbHZPkXNJCf%2F47XbbY5xrrVKNEUSzQ5sJB4ECRX%2F3kZFI4bsfl5Ld6Qwg2NISA0DLrjYYITcQPZVb4u8%2Bg3tFAD9mTEm7kHST6n9r7xqyLTsnOdyiqJdNaZxLRIJh67EGLIlt5LAW2fUhaB3BM6JZrIVaP7SuXPZxC1SFEk4KvAexgw5%2BAXPBEFWkjz2IzHMYx7cGpsM0hzyqak%2BbQ1rrMFSssKd%2FUoj44JzyY2PAXcc3BhwlYPPsmhCAXrdjWCdxDnFY3tbc7Zl4QYgWjWGzR%2BM4kk3ZEFezF6YsbEMRlVJPxuWmWU%2F3FpE5OKZldvWhGi5x2gmJswy7iBijEr38WOG3qC%2FVZiwQDM1Uez1uRlvYBXGv%2FXoTPLUNDel5TU3Nn8tgmv6vhwSMxfS7Q1vH8a%2BGzHpCiwDC4wzHgvqoOCI3DH%2F4z4prSY1odhU75W4oo4z932ZPgjryunFmR%2FSX2IZQK7HR3S%2FaaEPPA%3D%3D.NRYgexXa5xwkNbOz",
+        "id": 4
+    }
+]
