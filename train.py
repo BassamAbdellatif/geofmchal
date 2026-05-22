@@ -158,11 +158,11 @@ def calc_leaderboard_metrics(preds, targets):
         t_h = t_height[mask] * HEIGHT_NORM_CONSTANT
         return torch.sqrt(((p_h - t_h) ** 2).mean()).item()
 
-    mask_build = targets[:, 0] > 0.1
+    mask_build = targets[:, 0] > 0.5
     # Channel 3 is kept linear/untouched for Masked RMSE
     rmse_h_build = masked_rmse(preds[:, 3], targets[:, 3], mask_build)
 
-    mask_veg = targets[:, 1] > 0.1
+    mask_veg = targets[:, 1] > 0.5
     rmse_h_veg = masked_rmse(preds[:, 3], targets[:, 3], mask_veg)
 
     return iou_build, iou_veg, iou_water, rmse_h_build, rmse_h_veg
@@ -261,6 +261,12 @@ def main():
             TRAIN_TARGETS_DIR = args.train_targets_dir
 
     EXP_DIR = os.path.join(BASE_DIR, EXPERIMENT_NAME)
+    if os.path.exists(EXP_DIR):
+        import sys
+        print(f"\n🚨 [ERROR] Experiment directory already exists: {EXP_DIR}")
+        print("Please choose a different --experiment-name to avoid overwriting your previous results!\n")
+        sys.exit(1)
+        
     VIZ_OUTPUT_DIR = os.path.join(EXP_DIR, "visualizations")
     BEST_MODEL_PATH = os.path.join(EXP_DIR, "model_best_e1.pth")
     LAST_MODEL_PATH = os.path.join(EXP_DIR, "model_last.pth")
