@@ -140,13 +140,23 @@ class ImprovedCompositeLoss(nn.Module):
 
         # Height is now normalized, so we weight all 4 channels equally in base MAE
         self.mae_weights = torch.tensor([1.0, 1.0, 1.0, 1.0]).float()
-
     def forward(self, preds, targets):
         device = preds.device
-        mae_weights = self.mae_weights.to(device)
 
-        # --- 1. Base MAE (Foreground / Background Split) ---
-        abs_err = torch.abs(preds - targets)
+        # --- 1. CRITICAL FIX: LOGIT TO PROBABILITY CONVERSION ---
+        # Convert Abundance logits (Ch 0, 1, 2) to [0, 1] probabilities. 
+        # Keep Height (Ch 3) strictly linear.
+        preds_abund = torch.sigmoid(preds[:, :3, :, :])
+        preds_height = preds[:, 3:4, :, :]
+        
+        target_abund = targets[:, :3, :, :]
+        target_height = targets[:, 3:4, :, :]
+
+        # Re-concatenate for the base MAE function
+        preds_norm = torch.cat([preds_abund, preds_height], dim=1)
+
+        # --- 2. Base MAE (Foreground / Background Split) ---
+        abs_err = torch.abs(preds_norm - targets)
         fg_mask = (targets > 0).float()
         bg_mask = 1.0 - fg_mask
 
@@ -157,38 +167,39 @@ class ImprovedCompositeLoss(nn.Module):
         mae_bg = torch.sum(abs_err * bg_mask, dim=(0, 2, 3)) / bg_sum
 
         mae_per_channel = mae_fg + (self.bg_weight * mae_bg)
+        
+        # NEW BALANCE: Heavily penalize Building (0) and Water (2) errors
+        mae_weights = torch.tensor([3.0, 1.0, 3.0, 1.0]).to(device)
         loss_mae = torch.sum(mae_per_channel * mae_weights)
 
-        # --- 2. Structural & Gradient Loss on Land Cover Only ---
-        lc_pred = preds[:, :3, :, :]
-        lc_target = targets[:, :3, :, :]
+        # --- 3. Structural & Gradient Loss ---
+        # Now safely using valid [0,1] probabilities
+        loss_ssim = self.ssim(preds_abund, target_abund)
+        loss_grad = self.gdl(preds_abund, target_abund)
 
-        loss_ssim = self.ssim(lc_pred, lc_target)
-        loss_grad = self.gdl(lc_pred, lc_target)
+        # --- 4. Multi-Class Tversky Loss ---
+        # Removed the broken ReLU. Using clean probabilities.
+        t_build = self.tversky(preds_abund[:, 0, :, :], target_abund[:, 0, :, :])
+        t_veg = self.tversky(preds_abund[:, 1, :, :], target_abund[:, 1, :, :])
+        t_water = self.tversky(preds_abund[:, 2, :, :], target_abund[:, 2, :, :])
 
-        # --- 3. Multi-Class Tversky Loss ---
-        # Apply Tversky to all three land cover channels to balance recall
-        t_build = self.tversky(torch.relu(preds[:, 0, :, :]), targets[:, 0, :, :])
-        t_veg = self.tversky(torch.relu(preds[:, 1, :, :]), targets[:, 1, :, :])
-        t_water = self.tversky(torch.relu(preds[:, 2, :, :]), targets[:, 2, :, :])
+        # Weight Building and Water Tversky higher than Vegetation
+        loss_tversky = (2.0 * t_build + 0.5 * t_veg + 2.0 * t_water) / 4.5
 
-        # Average the Tversky losses so no single class dominates the optimization
-        loss_tversky = (t_build + t_veg + t_water) / 3.0
-
-        # --- 4. NEW: Height-Aware Building Masking ---
-        # Apply a 5x penalty to height errors specifically where building ground truth > 10%
-        build_presence_mask = (targets[:, 0, :, :] > 0.1).float()
-        height_err = torch.abs(preds[:, 3, :, :] - targets[:, 3, :, :])
-
-        # Base height error + boosted error on buildings
-        loss_height_boost = torch.mean(height_err * (1.0 + 5.0 * build_presence_mask))
+        # --- 5. Height-Aware Building Masking ---
+        build_presence_mask = (target_abund[:, 0, :, :] > 0.1).float()
+        height_err = torch.abs(preds_height - target_height)
+        
+        # Cleanly penalize height errors specifically on physical structures
+        # Averaged only over the pixels where buildings actually exist
+        loss_height_boost = torch.sum(height_err * build_presence_mask) / (torch.sum(build_presence_mask) + 1e-6)
 
         # --- Combine Total Loss ---
-        total_loss = (self.w_mae * loss_mae) + \
-                     (self.w_ssim * loss_ssim) + \
-                     (self.w_grad * loss_grad) + \
-                     (self.w_structure * loss_tversky) + \
-                     (self.w_structure * loss_height_boost)
+        # Hardcoding the lambdas here for safety to prevent config overrides
+        total_loss = (1.0 * loss_mae) + \
+                     (0.5 * loss_ssim) + \
+                     (0.5 * loss_grad) + \
+                     (2.0 * loss_tversky) + \
+                     (1.0 * loss_height_boost)
 
-        # Return tuple matching your training loop signature
         return total_loss, loss_mae, loss_ssim, loss_grad, loss_tversky
