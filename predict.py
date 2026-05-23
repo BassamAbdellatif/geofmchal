@@ -261,7 +261,7 @@ def main():
         print(f"Running inference on {len(test_pairs)} samples...")
         with torch.no_grad():
             for core_id, pixel_paths, patch_paths in tqdm(test_pairs, desc="Predicting"):
-                pixel_tensor, patch_tensor = process_multi_embeddings(pixel_paths, patch_paths, args.patch_size)
+                pixel_tensor, patch_tensor = process_multi_embeddings(pixel_paths, patch_paths, patch_size)
                 
                 pixel_batch = pixel_tensor.unsqueeze(0).to(DEVICE)
                 patch_batch = patch_tensor.unsqueeze(0).to(DEVICE)
