@@ -115,7 +115,7 @@ def save_experiment_config(pixel_inputs=None, patch_inputs=None):
         f.write(f"TRAIN_TARGETS_DIR: {TRAIN_TARGETS_DIR}\n")
         f.write(f"VAL_SPLIT: {VAL_SPLIT}\n")
         f.write(f"OPTIMIZER: AdamW\n")
-        f.write(f"SCHEDULER: ReduceLROnPlateau (factor=0.5, patience=2)\n")
+        f.write(f"SCHEDULER: CosineAnnealingWarmRestarts (T_0=15, T_mult=2, eta_min=1e-6)\n")
         f.write(f"GRADIENT CLIPPING: max_norm=1.0\n")
     print(f"📁 Created experiment folder: {EXP_DIR}")
 
@@ -358,8 +358,8 @@ def main():
     # NEW: AdamW with Weight Decay
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
-    # NEW: Aggressive Scheduler
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
+    # CosineAnnealingWarmRestarts: warm restarts at epoch 15, then 15+30=45, eta_min floors the LR
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=15, T_mult=2, eta_min=1e-6)
     criterion = ImprovedCompositeLoss(lambdas=LAMBDAS).to(DEVICE)
 
     print(f"Starting training on {DEVICE}...")
@@ -393,7 +393,7 @@ def main():
                 outputs = model(imgs)
                 batch_size = imgs.size(0)
 
-            loss, _, _, _, _ = criterion(outputs, targets)
+            loss, _, _, _, _ = criterion(outputs, targets, epoch, EPOCHS)
             loss.backward()
 
             # NEW: Gradient Clipping
@@ -430,7 +430,7 @@ def main():
                     outputs = model(imgs)
                     batch_size = imgs.size(0)
 
-                loss, l_mae, l_ssim, l_grad, l_tversky = criterion(outputs, targets)
+                loss, l_mae, l_ssim, l_grad, l_tversky = criterion(outputs, targets, epoch, EPOCHS)
                 val_running_loss += loss.item() * batch_size
 
                 val_components[0] += l_mae * batch_size
@@ -455,7 +455,11 @@ def main():
         epoch_metrics = val_metrics / len(val_ds)
         val_losses.append(epoch_val_loss)
 
-        scheduler.step(epoch_val_loss)
+        # Capture LR BEFORE step() changes it for the next epoch
+        current_lr = optimizer.param_groups[0]['lr']
+
+        # Step scheduler unconditionally every epoch (required by CosineAnnealingWarmRestarts)
+        scheduler.step()
 
         val_mae = epoch_comp[0].item()
         val_tversky = epoch_comp[3].item()
@@ -472,16 +476,18 @@ def main():
         epoch_times.append(epoch_elapsed)
         epoch_time_msg = f"   >> Epoch Time: {epoch_elapsed:.2f} seconds ({epoch_elapsed/60:.2f} minutes)\n"
         
-        print(f"Epoch {epoch + 1}/{EPOCHS} | Train: {epoch_loss:.4f} | Val: {epoch_val_loss:.4f}")
+        # Curriculum boost value for logging
+        current_boost = 1.0 + 4.0 * (epoch / max(EPOCHS - 1, 1))
+
+        print(f"Epoch {epoch + 1}/{EPOCHS} | Train: {epoch_loss:.4f} | Val: {epoch_val_loss:.4f} | LR: {current_lr:.2e} | HeightBoost: {current_boost:.2f}x")
         print(epoch_time_msg, end="")
         print(
             f"   >> Val Breakdown: MAE:{epoch_comp[0]:.3f} | SSIM:{epoch_comp[1]:.3f} | Grad:{epoch_comp[2]:.3f} | Tversky:{epoch_comp[3]:.3f}")
         print(f"   >> Leaderboard: IOU_B: {epoch_metrics[0]:.4f} | IOU_V: {epoch_metrics[1]:.4f} | IOU_W: {epoch_metrics[2]:.4f} | RMSE_H_B: {epoch_metrics[3]:.4f} | RMSE_H_V: {epoch_metrics[4]:.4f}")
 
         # Append epoch time to params log file
-        current_lr = optimizer.param_groups[0]['lr']
         with open(CONFIG_LOG_PATH, "a") as f:
-            f.write(f"Epoch {epoch + 1} finished in {epoch_elapsed:.2f}s | Train Loss: {epoch_loss:.4f} | Val Loss: {epoch_val_loss:.4f} | LR: {current_lr:.6f} | IOU_B: {epoch_metrics[0]:.4f} | IOU_V: {epoch_metrics[1]:.4f} | IOU_W: {epoch_metrics[2]:.4f} | RMSE_B: {epoch_metrics[3]:.4f} | RMSE_V: {epoch_metrics[4]:.4f}\n")
+            f.write(f"Epoch {epoch + 1} finished in {epoch_elapsed:.2f}s | Train Loss: {epoch_loss:.4f} | Val Loss: {epoch_val_loss:.4f} | LR: {current_lr:.2e} | HeightBoost: {current_boost:.2f}x | IOU_B: {epoch_metrics[0]:.4f} | IOU_V: {epoch_metrics[1]:.4f} | IOU_W: {epoch_metrics[2]:.4f} | RMSE_B: {epoch_metrics[3]:.4f} | RMSE_V: {epoch_metrics[4]:.4f}\n")
 
         # Clean memory to avoid leaks/fragmentation across epochs
         import gc

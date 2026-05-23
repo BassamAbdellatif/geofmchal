@@ -140,7 +140,7 @@ class ImprovedCompositeLoss(nn.Module):
 
         # Height is now normalized, so we weight all 4 channels equally in base MAE
         self.mae_weights = torch.tensor([1.0, 1.0, 1.0, 1.0]).float()
-    def forward(self, preds, targets):
+    def forward(self, preds, targets, current_epoch=0, total_epochs=50):
         device = preds.device
 
         # --- 1. CRITICAL FIX: LOGIT TO PROBABILITY CONVERSION ---
@@ -186,13 +186,14 @@ class ImprovedCompositeLoss(nn.Module):
         # Weight Building and Water Tversky higher than Vegetation
         loss_tversky = (2.0 * t_build + 0.5 * t_veg + 2.0 * t_water) / 4.5
 
-        # --- 5. Height-Aware Building Masking ---
+        # --- 5. Height-Aware Building Masking (Curriculum Learning) ---
+        # The height penalty ramps linearly from 1.0x at epoch 0 to 5.0x at the final epoch.
+        # Early epochs focus on abundance segmentation; later epochs increasingly
+        # demand accurate building height estimation.
+        current_boost = 1.0 + 4.0 * (current_epoch / max(total_epochs - 1, 1))
         build_presence_mask = (target_abund[:, 0, :, :] > 0.1).float()
         height_err = torch.abs(preds_height - target_height)
-        
-        # Cleanly penalize height errors specifically on physical structures
-        # Averaged only over the pixels where buildings actually exist
-        loss_height_boost = torch.sum(height_err * build_presence_mask) / (torch.sum(build_presence_mask) + 1e-6)
+        loss_height_boost = torch.sum(height_err * build_presence_mask) * current_boost / (torch.sum(build_presence_mask) + 1e-6)
 
         # --- Combine Total Loss ---
         # Hardcoding the lambdas here for safety to prevent config overrides
