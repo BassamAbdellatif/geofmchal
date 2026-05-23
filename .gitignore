@@ -2,3 +2,4 @@ runs/
 run.txt
 __pycache__/
 *.orig
+*.png
