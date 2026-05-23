@@ -1,19 +1,27 @@
 from playwright.sync_api import sync_playwright
+import json
 
-TARGET_URL = "https://platform-challenges.philab.esa.int/geoai"  # Replace with the actual competition URL
+TARGET_URL = "https://platform-challenges.philab.esa.int/geoai/submissions"  
 
 def discover():
     with sync_playwright() as p:
         print("Launching headless Chromium...")
         browser = p.chromium.launch(headless=True)
         context = browser.new_context()
+        
+        print("Loading session cookies...")
+        with open("uploader/cookies.json", "r") as f:
+            cookies = json.load(f)
+        context.add_cookies(cookies)
+        
         page = context.new_page()
 
         print(f"Navigating to {TARGET_URL}...")
         try:
-            page.goto(TARGET_URL, wait_until="networkidle")
+            page.goto(TARGET_URL, wait_until="networkidle", timeout=60000)
         except Exception as e:
             print(f"Failed to load URL: {e}")
+            page.screenshot(path="error_preview.png", full_page=True)
             browser.close()
             return
         

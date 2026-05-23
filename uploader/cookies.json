@@ -1,12 +1,12 @@
 [
     {
         "domain": ".esa.int",
-        "expirationDate": 1814047687.958785,
+        "expirationDate": 1814102699.329873,
         "hostOnly": false,
         "httpOnly": false,
         "name": "_ga",
         "path": "/",
-        "sameSite": "unspecified",
+        "sameSite": "Lax",
         "secure": false,
         "session": false,
         "storeId": "0",
@@ -15,16 +15,16 @@
     },
     {
         "domain": ".esa.int",
-        "expirationDate": 1814047687.95836,
+        "expirationDate": 1814102708.790322,
         "hostOnly": false,
         "httpOnly": false,
         "name": "_ga_N5NDQ5J59N",
         "path": "/",
-        "sameSite": "unspecified",
+        "sameSite": "Lax",
         "secure": false,
         "session": false,
         "storeId": "0",
-        "value": "GS2.1.s1779487634$o8$g1$t1779487687$j7$l0$h0",
+        "value": "GS2.1.s1779542691$o10$g1$t1779542708$j43$l0$h0",
         "id": 2
     },
     {
@@ -34,7 +34,7 @@
         "httpOnly": false,
         "name": "_ga_ZHJ78LLCSD",
         "path": "/",
-        "sameSite": "unspecified",
+        "sameSite": "Lax",
         "secure": false,
         "session": false,
         "storeId": "0",
@@ -43,16 +43,16 @@
     },
     {
         "domain": "platform-challenges.philab.esa.int",
-        "expirationDate": 1780697240.40557,
+        "expirationDate": 1780752298.694827,
         "hostOnly": true,
         "httpOnly": true,
         "name": "logtoCookies",
         "path": "/",
-        "sameSite": "lax",
+        "sameSite": "Lax",
         "secure": true,
         "session": false,
         "storeId": "0",
-        "value": "Tw4nMuWpZ3aA1bfttZ5DBJOUQcDEi4E64gO%2FxhMLHH05%2F9e8vO85rMcf0g03C2EXbWYsEzQC5ymBZEizOBsNtotXbH8XQAlLxn97Zifhbehig8NbTfUvk%2Flrm1wqUCBrvaxXEC3Uj3aPEaPfTrsizIuZcH3%2FaOSM7tVaJCrWJx8Wd%2FfBwdL24Wn1i4%2BW1UjzDYV3LG9cZnQclnTWPXbFzGRO84ZjYc52m3mjhVefe4vG%2BOOhpq7QZ3PFibHsvba2zHNQ0nZGAZ%2FUDwolbINY75T%2FUNhgTXM4ihtD9KZ2ckyJnatvkkKlvW5qMwaeGU0E4qS3HJdN7xxKzCkW44Nr%2BFsQ7%2FJshQLqI3IAdaySjxkzB99V1A0oBj1Yt5ZTEbbLVMouAKwt%2B836leo76G4JRDWDAE4ziHkCX9JGZ3R1uWYxx6URNdJjGGX59s9mrqq9Z99JPF0O8efkdM%2B9NTtG50vJm%2Ba79COXsY7BWyotE6TuedjFAh7ChcG5tReNBQOC66VMDYlh%2FGEGYDuD8hczDxPvhfjQbpRc%2Fzv%2FO2cFT2sf9Q5Ocft6Z0nV4CZS1GSWg1%2FS5WYhYwqQApVcWSwTBoQQNMyUUYCkWYnQ2V8ueNTLJYbqjxTQWN564GP5o%2FHYSAW1iSZ5TGtUEMTsJzkoImoKfSgVkWLWFqSbcHvf2jlPp%2FREDK30VE1plTY8zWuJCS6BXOKiw9N3nLOG1DTmk6dI2P9Ju10haJ8BjCbQ9QEVV9O%2BsGfmsy7qc6%2FbxfQeZbHZPkXNJCf%2F47XbbY5xrrVKNEUSzQ5sJB4ECRX%2F3kZFI4bsfl5Ld6Qwg2NISA0DLrjYYITcQPZVb4u8%2Bg3tFAD9mTEm7kHST6n9r7xqyLTsnOdyiqJdNaZxLRIJh67EGLIlt5LAW2fUhaB3BM6JZrIVaP7SuXPZxC1SFEk4KvAexgw5%2BAXPBEFWkjz2IzHMYx7cGpsM0hzyqak%2BbQ1rrMFSssKd%2FUoj44JzyY2PAXcc3BhwlYPPsmhCAXrdjWCdxDnFY3tbc7Zl4QYgWjWGzR%2BM4kk3ZEFezF6YsbEMRlVJPxuWmWU%2F3FpE5OKZldvWhGi5x2gmJswy7iBijEr38WOG3qC%2FVZiwQDM1Uez1uRlvYBXGv%2FXoTPLUNDel5TU3Nn8tgmv6vhwSMxfS7Q1vH8a%2BGzHpCiwDC4wzHgvqoOCI3DH%2F4z4prSY1odhU75W4oo4z932ZPgjryunFmR%2FSX2IZQK7HR3S%2FaaEPPA%3D%3D.NRYgexXa5xwkNbOz",
+        "value": "U%2BTXrK%2BA37N9oEOJ6DIgco7hrvHh2TOT0sDzK8ypeE4ba%2BZGNu5gOQhZ5IHuQkmbOCjC9DHa9oei8REbQFHUl8La3x%2Bg2es90HWwO2mGOBmHPJtQ9fejPIGCcza4k8WtsuNoo2RrTE75GJoYsHnIltKcTEPRkP10vbdPpzhGi4bP%2F1tPgGSVFhFn%2FiD8chxy%2BbPlbuIcb3vZ8s2Zl0zEUfjm72JwBJQ5aoBA4A%2FMEnKSND5wktsdmwaLgAX2bozhoLaiybN0NDwuzhRtSkV%2FN2yfY7BSCGetjfe21la%2FDFztT1Ph8HbDtm5MO%2Fw1s8%2B396D%2Fy0LQo4isO7YMQAn1yyacLXgvnpTzcqyjDgnzQTt%2FrpXTstrXWgY7ig%2FOYSEOiZsTLf7c%2FZtYlv2Rs8AmFiPXfi%2B2SZjnJ5t8T4FI%2Fg7LAZjBHYxPRKSErzsjzmkzMnG78J5B%2BBQZR3Zg57cn4y0gZ9WBr8xS4MdPj00x62nXyeKVcf6kauE%2Ba4Vx297%2FlR3ElVDYZP02NEUqMbnSG%2BDjcE3c%2BNaRcEmUjZvJwRNvJpcn7u6VVTgwg5F6kE1a2HaJfbeYUViaOyGfsOsxpQJ60zuEl6g7TQEsSyyZtzW3HOiwPTSOVmkWOpulGaEgFE25y%2FapY77eO550Bqlqy1qB4I%2BluKuOG5bypvAoNnWJ%2B6qFQNf0gN8N0KzHX%2FBtyS42hv1QRrdEmtl9cqBo%2FGMloeQ7VFiYnjh9zPknwWHJV%2FPdWxaRdSZ2dxYbgR92l7s9KULYyAKAQC6w28yUqV04Oaat1W2FUFnt%2BTsNE120dgBqKeRc08y4ukctsvlWH3Gf9eQ%2Ftxa5JkMJngYJhAaMffvojCyJmrybKFBig4ZKDAuuVKqWEB%2B2GRTD8Hd8wo3qdzllBhmXr5F5Z%2FGcw3WsmXmo9ND2RAF6kpBb9Og98rGrhwXqlZ3iKT1evdcGYIEfAQrWNLt9agxKyvjE6xfAcoHAJ9R5uUIP9Bu0YK%2BSAgzb5IsNQJBvWx595XR1xnewmJRkvMoaLq5CRe9IEDMrqVpbaBLMev9%2F8juI3zy56xFxEYgTMg8FczFPiBsY6OjOM98ax%2FLmfg6bMuWV3P3oJGw77P4sDuxAv5sTUdwGIukFcpPCHvaZG7lBEXNu711jmHHw1jwdriNtSTjMO%2BZ3z4xsfN%2FeGzxbwGEfO9jS1N74IBsq6OzfbPSuqNCGRpaqW6zfP6fbJv2SXTGx4rxVqmwGiEkCofo43w%3D%3D.zKekIU30W%2F71eBIg",
         "id": 4
     }
 ]
