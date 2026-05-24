@@ -244,7 +244,7 @@ def main():
     EPOCHS = args.epochs
 
     # Resolve directories using config.py
-    if MODEL_TYPE == "attention_fusion":
+    if MODEL_TYPE in ("attention_fusion", "ynet_attention_fusion"):
         pixel_dirs = resolve_dirs(args.pixel_inputs, PIXEL_DIR_MAP)
         patch_dirs = resolve_dirs(args.patch_inputs, PATCH_DIR_MAP)
         targets_dir = args.train_targets_dir if args.train_targets_dir is not None else config.LABELS_DIR
@@ -284,7 +284,7 @@ def main():
         save_experiment_config(args_augment=args.augment, args_dynamic_loss=args.dynamic_loss)
 
     print("--- 1. Data Setup ---")
-    if MODEL_TYPE == "attention_fusion":
+    if MODEL_TYPE in ("attention_fusion", "ynet_attention_fusion"):
         all_train_triplets = find_triple_file_pairs(pixel_dirs, patch_dirs, targets_dir)
         print(f"   >> Total matched triplets found: {len(all_train_triplets)}")
         if len(all_train_triplets) == 0:
