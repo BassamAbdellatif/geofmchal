@@ -92,7 +92,7 @@ def resolve_dirs(input_str, name_map):
     return paths
 
 
-def save_experiment_config(pixel_inputs=None, patch_inputs=None):
+def save_experiment_config(args_augment=False, args_dynamic_loss=False, pixel_inputs=None, patch_inputs=None):
     """Logs all hyperparameters to a text file in the experiment folder."""
     os.makedirs(EXP_DIR, exist_ok=True)
     os.makedirs(VIZ_OUTPUT_DIR, exist_ok=True)
@@ -115,8 +115,10 @@ def save_experiment_config(pixel_inputs=None, patch_inputs=None):
         f.write(f"TRAIN_TARGETS_DIR: {TRAIN_TARGETS_DIR}\n")
         f.write(f"VAL_SPLIT: {VAL_SPLIT}\n")
         f.write(f"OPTIMIZER: AdamW\n")
-        f.write(f"SCHEDULER: CosineAnnealingWarmRestarts (T_0=15, T_mult=2, eta_min=1e-6)\n")
+        f.write(f"SCHEDULER: CosineAnnealingLR (T_max=epochs, eta_min=1e-6)\n")
         f.write(f"GRADIENT CLIPPING: max_norm=1.0\n")
+        f.write(f"AUGMENT: {args_augment}\n")
+        f.write(f"DYNAMIC_LOSS: {args_dynamic_loss}\n")
     print(f"📁 Created experiment folder: {EXP_DIR}")
 
 
@@ -134,6 +136,8 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=EPOCHS)
     parser.add_argument("--num-workers", type=int, default=8, help="Number of worker processes for DataLoader.")
     parser.add_argument("--cache-in-memory", action="store_true", help="Cache dataset samples in CPU RAM on first load to speed up subsequent epochs.")
+    parser.add_argument("--augment", action="store_true", help="Enable synchronized spatial augmentation on the training set (flip + rot90).")
+    parser.add_argument("--dynamic-loss", action="store_true", help="Enable curriculum height penalty ramp (1x -> 5x over training).")
     return parser.parse_args()
 
 
@@ -273,10 +277,11 @@ def main():
     LOSS_CURVE_PATH = os.path.join(EXP_DIR, "loss_curve.png")
     CONFIG_LOG_PATH = os.path.join(EXP_DIR, "training_params.txt")
 
-    if MODEL_TYPE == "attention_fusion":
-        save_experiment_config(pixel_inputs=args.pixel_inputs, patch_inputs=args.patch_inputs)
+    if MODEL_TYPE == "attention_fusion" or MODEL_TYPE == "ynet_attention_fusion":
+        save_experiment_config(args_augment=args.augment, args_dynamic_loss=args.dynamic_loss,
+                               pixel_inputs=args.pixel_inputs, patch_inputs=args.patch_inputs)
     else:
-        save_experiment_config()
+        save_experiment_config(args_augment=args.augment, args_dynamic_loss=args.dynamic_loss)
 
     print("--- 1. Data Setup ---")
     if MODEL_TYPE == "attention_fusion":
@@ -290,8 +295,8 @@ def main():
         train_triplets, val_triplets = train_test_split(
             all_train_triplets, test_size=VAL_SPLIT, random_state=RANDOM_SEED
         )
-        train_ds = Emb2HeightsDataset(train_triplets, patch_size=PATCH_SIZE, scale_factor=16, is_train=True, cache_in_memory=args.cache_in_memory)
-        val_ds = Emb2HeightsDataset(val_triplets, patch_size=PATCH_SIZE, scale_factor=16, is_train=False, cache_in_memory=args.cache_in_memory)
+        train_ds = Emb2HeightsDataset(train_triplets, patch_size=PATCH_SIZE, scale_factor=16, is_train=True,  cache_in_memory=args.cache_in_memory, augment=args.augment)
+        val_ds   = Emb2HeightsDataset(val_triplets,   patch_size=PATCH_SIZE, scale_factor=16, is_train=False, cache_in_memory=args.cache_in_memory, augment=False)
         print(f"   >> Train split triplets: {len(train_ds)}")
         print(f"   >> Val split triplets:   {len(val_ds)}")
         
@@ -358,8 +363,8 @@ def main():
     # NEW: AdamW with Weight Decay
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
-    # CosineAnnealingWarmRestarts: warm restarts at epoch 15, then 15+30=45, eta_min floors the LR
-    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=15, T_mult=2, eta_min=1e-6)
+    # CosineAnnealingLR: cosine decay from LR to eta_min over all epochs, no warm restarts
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
     criterion = ImprovedCompositeLoss(lambdas=LAMBDAS).to(DEVICE)
 
     print(f"Starting training on {DEVICE}...")
@@ -393,7 +398,7 @@ def main():
                 outputs = model(imgs)
                 batch_size = imgs.size(0)
 
-            loss, _, _, _, _ = criterion(outputs, targets, epoch, EPOCHS)
+            loss, _, _, _, _ = criterion(outputs, targets, epoch, EPOCHS, use_dynamic_loss=args.dynamic_loss)
             loss.backward()
 
             # NEW: Gradient Clipping
@@ -430,7 +435,7 @@ def main():
                     outputs = model(imgs)
                     batch_size = imgs.size(0)
 
-                loss, l_mae, l_ssim, l_grad, l_tversky = criterion(outputs, targets, epoch, EPOCHS)
+                loss, l_mae, l_ssim, l_grad, l_tversky = criterion(outputs, targets, epoch, EPOCHS, use_dynamic_loss=args.dynamic_loss)
                 val_running_loss += loss.item() * batch_size
 
                 val_components[0] += l_mae * batch_size

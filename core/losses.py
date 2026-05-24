@@ -140,7 +140,7 @@ class ImprovedCompositeLoss(nn.Module):
 
         # Height is now normalized, so we weight all 4 channels equally in base MAE
         self.mae_weights = torch.tensor([1.0, 1.0, 1.0, 1.0]).float()
-    def forward(self, preds, targets, current_epoch=0, total_epochs=50):
+    def forward(self, preds, targets, current_epoch=0, total_epochs=50, use_dynamic_loss=False):
         device = preds.device
 
         # --- 1. CRITICAL FIX: LOGIT TO PROBABILITY CONVERSION ---
@@ -187,8 +187,12 @@ class ImprovedCompositeLoss(nn.Module):
         loss_tversky = (2.0 * t_build + 0.5 * t_veg + 2.0 * t_water) / 4.5
 
         # --- 5. Height-Aware Building Masking (Curriculum Learning, Decoupled) ---
-        # The height penalty ramps linearly from 1.0x at epoch 0 to 5.0x at the final epoch.
-        current_boost = 1.0 + 4.0 * (current_epoch / max(total_epochs - 1, 1))
+        # If use_dynamic_loss=True, height penalty ramps linearly 1.0x -> 5.0x.
+        # If use_dynamic_loss=False, height boost is locked at 1.0 (no curriculum).
+        if use_dynamic_loss:
+            current_boost = 1.0 + 4.0 * (current_epoch / max(total_epochs - 1, 1))
+        else:
+            current_boost = 1.0
 
         # DECOUPLING: build_presence_mask is derived purely from the ground-truth target.
         # Using .detach() on target_abund (which is already a target tensor, not a prediction)

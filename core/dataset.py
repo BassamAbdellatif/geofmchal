@@ -8,6 +8,45 @@ from torch.utils.data import Dataset
 
 HEIGHT_NORM_CONSTANT = 30.0
 
+
+def augment_triplet(pixel_emb, patch_emb, target):
+    """
+    Applies identical random spatial augmentations to all three tensors,
+    maintaining perfect spatial alignment between the 256x256 pixel grid
+    and the 16x16 patch grid.
+
+    Args:
+        pixel_emb : [C_pix, H, W]       — full-resolution pixel embedding
+        patch_emb : [C_pat, H//16, W//16] — downscaled patch embedding
+        target    : [4, H, W]           — ground-truth label
+
+    Returns:
+        Tuple of (pixel_emb, patch_emb, target) after augmentation.
+    """
+    # --- Random Horizontal Flip (50% probability) ---
+    if torch.rand(1).item() < 0.5:
+        pixel_emb = torch.flip(pixel_emb, dims=[2])
+        patch_emb = torch.flip(patch_emb, dims=[2])
+        target    = torch.flip(target,    dims=[2])
+
+    # --- Random Vertical Flip (50% probability) ---
+    if torch.rand(1).item() < 0.5:
+        pixel_emb = torch.flip(pixel_emb, dims=[1])
+        patch_emb = torch.flip(patch_emb, dims=[1])
+        target    = torch.flip(target,    dims=[1])
+
+    # --- Random 90-degree Rotation (0 / 90 / 180 / 270 degrees) ---
+    # rot90 on dims=[1,2] works on [C, H, W] tensors.
+    # The same k applies to both grids — alignment is preserved because
+    # rotating 90° on a 16x16 grid is the correct transform for a 256x256 grid.
+    k = torch.randint(0, 4, (1,)).item()
+    if k > 0:
+        pixel_emb = torch.rot90(pixel_emb, k, dims=[1, 2])
+        patch_emb = torch.rot90(patch_emb, k, dims=[1, 2])
+        target    = torch.rot90(target,    k, dims=[1, 2])
+
+    return pixel_emb, patch_emb, target
+
 def _normalize_core_id(filename):
     """
     Extracts the pure core ID by stripping all known prefixes,
@@ -211,12 +250,13 @@ def find_triple_file_pairs(pixel_dirs, patch_dirs, label_dir):
 
 
 class Emb2HeightsDataset(Dataset):
-    def __init__(self, file_triplets, patch_size=256, scale_factor=16, is_train=True, cache_in_memory=False):
+    def __init__(self, file_triplets, patch_size=256, scale_factor=16, is_train=True, cache_in_memory=False, augment=False):
         self.file_triplets = file_triplets
         self.patch_size = patch_size
         self.scale_factor = scale_factor
         self.is_train = is_train
         self.cache_in_memory = cache_in_memory
+        self.augment = augment  # Only apply augmentation to training set
         
         self.shared_pixel_embs = []
         self.shared_patch_embs = []
@@ -409,14 +449,18 @@ class Emb2HeightsDataset(Dataset):
 
         # Convert back to float32 if loaded from float16 cache
         if self.cache_in_memory:
-            return {
-                "pixel_emb": pixel_emb_crop.float(),
-                "patch_emb": patch_emb_crop.float(),
-                "target": target_crop.float()
-            }
-        else:
-            return {
-                "pixel_emb": pixel_emb_crop,
-                "patch_emb": patch_emb_crop,
-                "target": target_crop
-            }
+            pixel_emb_crop = pixel_emb_crop.float()
+            patch_emb_crop = patch_emb_crop.float()
+            target_crop    = target_crop.float()
+
+        # --- Synchronized Augmentation ---
+        if self.augment:
+            pixel_emb_crop, patch_emb_crop, target_crop = augment_triplet(
+                pixel_emb_crop, patch_emb_crop, target_crop
+            )
+
+        return {
+            "pixel_emb": pixel_emb_crop,
+            "patch_emb": patch_emb_crop,
+            "target":    target_crop
+        }
