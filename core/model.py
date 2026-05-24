@@ -481,6 +481,116 @@ class AttentionFusedDecoder(nn.Module):
         return logits
 
 
+class YNetDecoder(nn.Module):
+    """
+    A single decoder branch of the Y-Net. Receives the bottleneck
+    and all 4 encoder skip connections, and produces `out_channels` output maps.
+    This is instantiated TWICE (once for classification, once for height).
+    """
+
+    def __init__(self, out_channels: int):
+        super().__init__()
+        # Stage 1: 16x16 -> 32x32
+        self.up1 = StandardUpsampleBlock(512, 256)
+        self.att1 = AttentionGate(F_g=256, F_x=512, F_int=256)
+        self.dec_conv1 = ResidualConvBlock(768, 256)
+
+        # Stage 2: 32x32 -> 64x64
+        self.up2 = StandardUpsampleBlock(256, 128)
+        self.att2 = AttentionGate(F_g=128, F_x=256, F_int=128)
+        self.dec_conv2 = ResidualConvBlock(384, 128)
+
+        # Stage 3: 64x64 -> 128x128
+        self.up3 = StandardUpsampleBlock(128, 64)
+        self.att3 = AttentionGate(F_g=64, F_x=128, F_int=64)
+        self.dec_conv3 = ResidualConvBlock(192, 64)
+
+        # Stage 4: 128x128 -> 256x256
+        self.up4 = StandardUpsampleBlock(64, 32)
+        self.att4 = AttentionGate(F_g=32, F_x=64, F_int=32)
+        self.dec_conv4 = ResidualConvBlock(96, 32)
+
+        # Output head
+        self.head = nn.Conv2d(32, out_channels, kernel_size=1)
+
+    def forward(self, fused, x1, x2, x3, x4):
+        """fused: [B, 512, 16, 16] | x1-x4: encoder skip connections."""
+        d1 = self.up1(fused)                    # [B, 256, 32, 32]
+        gated_x4 = self.att1(x4, d1)            # [B, 512, 32, 32]
+        d1 = torch.cat([d1, gated_x4], dim=1)   # [B, 768, 32, 32]
+        d1 = self.dec_conv1(d1)                 # [B, 256, 32, 32]
+
+        d2 = self.up2(d1)                       # [B, 128, 64, 64]
+        gated_x3 = self.att2(x3, d2)            # [B, 256, 64, 64]
+        d2 = torch.cat([d2, gated_x3], dim=1)   # [B, 384, 64, 64]
+        d2 = self.dec_conv2(d2)                 # [B, 128, 64, 64]
+
+        d3 = self.up3(d2)                       # [B, 64, 128, 128]
+        gated_x2 = self.att3(x2, d3)            # [B, 128, 128, 128]
+        d3 = torch.cat([d3, gated_x2], dim=1)   # [B, 192, 128, 128]
+        d3 = self.dec_conv3(d3)                 # [B, 64, 128, 128]
+
+        d4 = self.up4(d3)                       # [B, 32, 256, 256]
+        gated_x1 = self.att4(x1, d4)            # [B, 64, 256, 256]
+        d4 = torch.cat([d4, gated_x1], dim=1)   # [B, 96, 256, 256]
+        d4 = self.dec_conv4(d4)                 # [B, 32, 256, 256]
+
+        return self.head(d4)
+
+
+class YNetAttentionFusedDecoder(nn.Module):
+    """
+    Y-Net: Shared U-Net Encoder + Patch Fusion Bottleneck with TWO
+    completely independent decoders to prevent gradient conflicts:
+      - decoder_class  : 3 channels (Building, Vegetation, Water)
+      - decoder_height : 1 channel  (nDSM Height)
+
+    Outputs are concatenated at the end -> [B, 4, 256, 256].
+    BatchNorm is applied after every convolution (already done inside
+    DoubleConv, ResidualConvBlock, StandardUpsampleBlock, AttentionGate).
+    """
+
+    def __init__(self, pixel_channels=128, patch_channels=768):
+        super().__init__()
+
+        # --- SHARED ENCODER (identical to AttentionFusedDecoder) ---
+        self.inc   = DoubleConv(pixel_channels, 64)
+        self.down1 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(64, 128))
+        self.down2 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(128, 256))
+        self.down3 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(256, 512))
+        self.down4_pool = nn.MaxPool2d(2)
+
+        # --- SHARED BOTTLENECK FUSION ---
+        self.fusion_conv = nn.Sequential(
+            nn.Conv2d(512 + patch_channels, 512, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True)
+        )
+
+        # --- TWO INDEPENDENT DECODER BRANCHES ---
+        self.decoder_class  = YNetDecoder(out_channels=3)  # Building / Veg / Water
+        self.decoder_height = YNetDecoder(out_channels=1)  # nDSM Height
+
+    def forward(self, pixel_emb, patch_emb):
+        # 1. Shared encoder
+        x1 = self.inc(pixel_emb)              # [B,  64, 256, 256]
+        x2 = self.down1(x1)                   # [B, 128, 128, 128]
+        x3 = self.down2(x2)                   # [B, 256,  64,  64]
+        x4 = self.down3(x3)                   # [B, 512,  32,  32]
+        enc_bottleneck = self.down4_pool(x4)  # [B, 512,  16,  16]
+
+        # 2. Shared bottleneck fusion with patch embedding
+        fused = torch.cat([enc_bottleneck, patch_emb], dim=1)  # [B, 1280, 16, 16]
+        fused = self.fusion_conv(fused)                        # [B,  512, 16, 16]
+
+        # 3. Two independent decoders — no shared gradients past this point
+        class_out  = self.decoder_class(fused, x1, x2, x3, x4)   # [B, 3, 256, 256]
+        height_out = self.decoder_height(fused, x1, x2, x3, x4)  # [B, 1, 256, 256]
+
+        # 4. Concatenate -> [B, 4, 256, 256]
+        return torch.cat([class_out, height_out], dim=1)
+
+
 def infer_model_type(n_channels):
     if n_channels == 768:
         return "decoder_residual"
@@ -498,7 +608,9 @@ def build_model(model_type, n_channels, n_classes, pixel_channels=128, patch_cha
         return EfficientDecoder256Fast(in_channels=n_channels, out_channels=n_classes), selected
     if selected == "attention_fusion":
         return AttentionFusedDecoder(pixel_channels=pixel_channels, patch_channels=patch_channels, out_channels=n_classes), selected
+    if selected == "ynet_attention_fusion":
+        return YNetAttentionFusedDecoder(pixel_channels=pixel_channels, patch_channels=patch_channels), selected
 
     raise ValueError(
-        f"Unknown model_type '{model_type}'. Use one of: auto, lightunet, only_decoder, decoder_residual, attention_fusion"
+        f"Unknown model_type '{model_type}'. Use one of: auto, lightunet, decoder_residual, attention_fusion, ynet_attention_fusion"
     )

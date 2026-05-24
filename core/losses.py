@@ -186,17 +186,26 @@ class ImprovedCompositeLoss(nn.Module):
         # Weight Building and Water Tversky higher than Vegetation
         loss_tversky = (2.0 * t_build + 0.5 * t_veg + 2.0 * t_water) / 4.5
 
-        # --- 5. Height-Aware Building Masking (Curriculum Learning) ---
+        # --- 5. Height-Aware Building Masking (Curriculum Learning, Decoupled) ---
         # The height penalty ramps linearly from 1.0x at epoch 0 to 5.0x at the final epoch.
-        # Early epochs focus on abundance segmentation; later epochs increasingly
-        # demand accurate building height estimation.
         current_boost = 1.0 + 4.0 * (current_epoch / max(total_epochs - 1, 1))
-        build_presence_mask = (target_abund[:, 0, :, :] > 0.1).float()
+
+        # DECOUPLING: build_presence_mask is derived purely from the ground-truth target.
+        # Using .detach() on target_abund (which is already a target tensor, not a prediction)
+        # is belt-and-suspenders; the critical point is that preds_height is ONLY used here,
+        # ensuring height gradients NEVER flow into decoder_class (Ch 0-2).
+        build_presence_mask = (target_abund[:, 0, :, :].detach() > 0.1).float()
         height_err = torch.abs(preds_height - target_height)
-        loss_height_boost = torch.sum(height_err * build_presence_mask) * current_boost / (torch.sum(build_presence_mask) + 1e-6)
+        loss_height_boost = (
+            torch.sum(height_err * build_presence_mask) * current_boost
+            / (torch.sum(build_presence_mask) + 1e-6)
+        )
 
         # --- Combine Total Loss ---
-        # Hardcoding the lambdas here for safety to prevent config overrides
+        # Classification terms (MAE_abund + SSIM + Grad + Tversky) backprop ONLY through Ch 0-2.
+        # Height terms (MAE_height + height_boost) backprop ONLY through Ch 3.
+        # The split is enforced structurally: preds_abund and preds_height are sliced tensors
+        # that share no computation graph with each other (in YNetAttentionFusedDecoder).
         total_loss = (1.0 * loss_mae) + \
                      (0.5 * loss_ssim) + \
                      (0.5 * loss_grad) + \

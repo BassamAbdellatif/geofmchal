@@ -122,7 +122,7 @@ def save_experiment_config(pixel_inputs=None, patch_inputs=None):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train emb2heights baseline models")
-    parser.add_argument("--model-type", type=str, default=MODEL_TYPE, choices=["auto", "lightunet", "decoder_residual", "attention_fusion"])
+    parser.add_argument("--model-type", type=str, default=MODEL_TYPE, choices=["auto", "lightunet", "decoder_residual", "attention_fusion", "ynet_attention_fusion"])
     parser.add_argument("--output-dir", type=str, default=BASE_DIR)
     parser.add_argument("--train-embeddings-dir", type=str, default=None, help="Path to training embeddings. Defaults to path in config.py based on model-type.")
     parser.add_argument("--train-targets-dir", type=str, default=None, help="Path to training targets. Defaults to path in config.py.")
