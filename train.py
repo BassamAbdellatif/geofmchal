@@ -370,7 +370,7 @@ def main():
     print(f"Starting training on {DEVICE}...")
 
     train_losses, val_losses = [], []
-    best_val_score = float('inf')
+    best_val_score = 0.0   # proxy leaderboard score — higher is better
     best_epoch = 0
     best_metrics = None
     epoch_times = []
@@ -466,16 +466,30 @@ def main():
         # Step scheduler unconditionally every epoch (required by CosineAnnealingWarmRestarts)
         scheduler.step()
 
-        val_mae = epoch_comp[0].item()
-        val_tversky = epoch_comp[3].item()
-        val_score = val_mae + (val_tversky * 2.0)
+        # Proxy leaderboard score (higher = better), aligned to platform weights:
+        #   mIoU_buildings 25%, mIoU_trees 15%, mIoU_water 15%,
+        #   RMSE_building_height 25%, RMSE_vegetation_height 20%
+        # RMSE is converted to a 0-1 quality score: quality = 1 - RMSE / HEIGHT_NORM_CONSTANT
+        # (e.g. 3m RMSE → 0.90 quality, 6m → 0.80, 0m → 1.0)
+        iou_b = epoch_metrics[0].item()
+        iou_v = epoch_metrics[1].item()
+        iou_w = epoch_metrics[2].item()
+        rmse_b = epoch_metrics[3].item()
+        rmse_v = epoch_metrics[4].item()
+        rmse_b_quality = max(0.0, 1.0 - rmse_b / HEIGHT_NORM_CONSTANT)
+        rmse_v_quality = max(0.0, 1.0 - rmse_v / HEIGHT_NORM_CONSTANT)
+        proxy_score = (0.25 * iou_b
+                     + 0.15 * iou_v
+                     + 0.15 * iou_w
+                     + 0.25 * rmse_b_quality
+                     + 0.20 * rmse_v_quality)
 
-        if val_score < best_val_score:
-            best_val_score = val_score
+        if proxy_score > best_val_score:
+            best_val_score = proxy_score
             best_epoch = epoch + 1
             best_metrics = epoch_metrics
             torch.save(model.state_dict(), BEST_MODEL_PATH)
-            print(f"   >> [Checkpoint] New best model saved! (Score: {val_score:.4f} | MAE: {val_mae:.4f} | Tversky: {val_tversky:.4f})")
+            print(f"   >> [Checkpoint] New best model saved! (ProxyScore: {proxy_score:.4f} | IOU_B: {iou_b:.4f} | RMSE_B: {rmse_b:.4f}m | RMSE_V: {rmse_v:.4f}m)")
 
         epoch_elapsed = time.time() - epoch_start_time
         epoch_times.append(epoch_elapsed)
@@ -492,7 +506,7 @@ def main():
 
         # Append epoch time to params log file
         with open(CONFIG_LOG_PATH, "a") as f:
-            f.write(f"Epoch {epoch + 1} finished in {epoch_elapsed:.2f}s | Train Loss: {epoch_loss:.4f} | Val Loss: {epoch_val_loss:.4f} | LR: {current_lr:.2e} | HeightBoost: {current_boost:.2f}x | IOU_B: {epoch_metrics[0]:.4f} | IOU_V: {epoch_metrics[1]:.4f} | IOU_W: {epoch_metrics[2]:.4f} | RMSE_B: {epoch_metrics[3]:.4f} | RMSE_V: {epoch_metrics[4]:.4f}\n")
+            f.write(f"Epoch {epoch + 1} finished in {epoch_elapsed:.2f}s | Train Loss: {epoch_loss:.4f} | Val Loss: {epoch_val_loss:.4f} | LR: {current_lr:.2e} | HeightBoost: {current_boost:.2f}x | IOU_B: {iou_b:.4f} | IOU_V: {iou_v:.4f} | IOU_W: {iou_w:.4f} | RMSE_B: {rmse_b:.4f} | RMSE_V: {rmse_v:.4f} | Proxy: {proxy_score:.4f}\n")
 
         # Clean memory to avoid leaks/fragmentation across epochs
         import gc
@@ -506,7 +520,7 @@ def main():
         summary_msg = (
             f"\n=== BEST MODEL SUMMARY ===\n"
             f"Best Epoch: {best_epoch}\n"
-            f"Best Val Score (Tversky + 2*MAE): {best_val_score:.4f}\n"
+            f"Best Proxy Leaderboard Score: {best_val_score:.4f}\n"
             f"Leaderboard Metrics at Best Epoch -> IOU_B: {best_metrics[0]:.4f} | IOU_V: {best_metrics[1]:.4f} | IOU_W: {best_metrics[2]:.4f} | RMSE_B: {best_metrics[3]:.4f} | RMSE_V: {best_metrics[4]:.4f}\n"
         )
         print(summary_msg, end="")

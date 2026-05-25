@@ -3,6 +3,26 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class GradScale(torch.autograd.Function):
+    """
+    Identity in the forward pass; scales the gradient by `scale` in the backward pass.
+    Used to reduce the height decoder's gradient contribution to the shared encoder
+    without fully detaching it (Option A gradient hook).
+    """
+    @staticmethod
+    def forward(ctx, x, scale):
+        ctx.scale = scale
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output * ctx.scale, None
+
+
+def grad_scale(x, alpha: float):
+    return GradScale.apply(x, alpha)
+
+
 # ==========================================
 # 1. LIGHT UNET COMPONENTS
 # ==========================================
@@ -550,8 +570,12 @@ class YNetAttentionFusedDecoder(nn.Module):
     DoubleConv, ResidualConvBlock, StandardUpsampleBlock, AttentionGate).
     """
 
-    def __init__(self, pixel_channels=128, patch_channels=768):
+    def __init__(self, pixel_channels=128, patch_channels=768, height_grad_scale=0.1):
         super().__init__()
+
+        # Fraction of height-decoder gradient that reaches the shared encoder.
+        # 1.0 = full coupling (original Y-Net), 0.0 = full detach, 0.1 = gentle whisper.
+        self.height_grad_scale = height_grad_scale
 
         # --- SHARED ENCODER (identical to AttentionFusedDecoder) ---
         self.inc   = DoubleConv(pixel_channels, 64)
@@ -583,9 +607,22 @@ class YNetAttentionFusedDecoder(nn.Module):
         fused = torch.cat([enc_bottleneck, patch_emb], dim=1)  # [B, 1280, 16, 16]
         fused = self.fusion_conv(fused)                        # [B,  512, 16, 16]
 
-        # 3. Two independent decoders — no shared gradients past this point
-        class_out  = self.decoder_class(fused, x1, x2, x3, x4)   # [B, 3, 256, 256]
-        height_out = self.decoder_height(fused, x1, x2, x3, x4)  # [B, 1, 256, 256]
+        # 3. Gradient hook: classification decoder owns the encoder at full strength.
+        #    Height decoder contributes only height_grad_scale (default 0.1) of its
+        #    gradient back through the bottleneck and all skip connections.
+        #    GradScale is a no-op in the forward pass — zero extra computation.
+        if self.training and self.height_grad_scale < 1.0:
+            alpha = self.height_grad_scale
+            fused_h = grad_scale(fused, alpha)
+            x1_h    = grad_scale(x1,    alpha)
+            x2_h    = grad_scale(x2,    alpha)
+            x3_h    = grad_scale(x3,    alpha)
+            x4_h    = grad_scale(x4,    alpha)
+        else:
+            fused_h, x1_h, x2_h, x3_h, x4_h = fused, x1, x2, x3, x4
+
+        class_out  = self.decoder_class( fused,   x1,   x2,   x3,   x4)   # [B, 3, 256, 256]
+        height_out = self.decoder_height(fused_h, x1_h, x2_h, x3_h, x4_h) # [B, 1, 256, 256]
 
         # 4. Concatenate -> [B, 4, 256, 256]
         return torch.cat([class_out, height_out], dim=1)
