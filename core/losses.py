@@ -205,6 +205,13 @@ class ImprovedCompositeLoss(nn.Module):
             / (torch.sum(build_presence_mask) + 1e-6)
         )
 
+        # Symmetric vegetation height boost — critical for RMSE_V (was 3.74m ≈ zero platform quality)
+        veg_presence_mask = (target_abund[:, 1, :, :].detach() > 0.1).float()
+        loss_veg_height_boost = (
+            torch.sum(height_err * veg_presence_mask) * current_boost
+            / (torch.sum(veg_presence_mask) + 1e-6)
+        )
+
         # --- Combine Total Loss ---
         # Classification terms (MAE_abund + SSIM + Grad + Tversky) backprop ONLY through Ch 0-2.
         # Height terms (MAE_height + height_boost) backprop ONLY through Ch 3.
@@ -214,6 +221,7 @@ class ImprovedCompositeLoss(nn.Module):
                      (0.5 * loss_ssim) + \
                      (0.5 * loss_grad) + \
                      (2.0 * loss_tversky) + \
-                     (1.0 * loss_height_boost)
+                     (1.0 * loss_height_boost) + \
+                     (1.0 * loss_veg_height_boost)
 
         return total_loss, loss_mae, loss_ssim, loss_grad, loss_tversky

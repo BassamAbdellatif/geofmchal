@@ -1,17 +1,32 @@
 import os
+import sys
 import json
+import argparse
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import config
 from playwright.sync_api import sync_playwright
 
 # --- CONFIGURABLE VARIABLES ---
 URL = "https://platform-challenges.philab.esa.int/geoai/submissions"
-FILE_PATH = "/mnt/head/users/bassam/src/geofmchal/runs/2A_alpha_ts1_ts2_nologits/submission_2A_alpha_ts1_ts2_nologits.zip"
 USE_COOKIES = True
-COOKIES_FILE = "uploader/cookies.json"
+COOKIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.json")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Upload a competition submission zip directly to the ESA platform.")
+    parser.add_argument("--experiment-name", type=str, required=True,
+                        help="Name of the experiment (must match the run folder and zip created by submit.py).")
+    return parser.parse_args()
 
 
 def upload_submission():
+    args = parse_args()
+    exp_dir = os.path.join(config.SHARED_RUNS_DIR, args.experiment_name)
+    FILE_PATH = os.path.join(exp_dir, f"submission_{args.experiment_name}.zip")
+
     if not os.path.exists(FILE_PATH):
         print(f"❌ Error: Submission file not found at {FILE_PATH}")
+        print(f"   → Run submit.py --experiment-name {args.experiment_name} first.")
         return
 
     with sync_playwright() as p:

@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 import torch
 import torch.optim as optim
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, get_worker_info
 from sklearn.model_selection import train_test_split
 from tqdm.auto import tqdm
 
@@ -63,6 +63,14 @@ np.random.seed(RANDOM_SEED)
 random.seed(RANDOM_SEED)
 
 
+def worker_init_fn(worker_id):
+    # Seed numpy per worker so crop positions are diverse across workers.
+    # PyTorch already handles its own RNG per worker; this fixes numpy only.
+    worker_info = get_worker_info()
+    seed = worker_info.seed % (2**32)
+    np.random.seed(seed)
+
+
 PIXEL_DIR_MAP = {
     "tessera": config.TESSERA_DIR,
     "alpha_earth": config.ALPHA_EARTH_DIR,
@@ -107,7 +115,7 @@ def save_experiment_config(args_augment=False, args_dynamic_loss=False, pixel_in
         f.write(f"WEIGHT_DECAY: {WEIGHT_DECAY}\n")
         f.write(f"LOSS LAMBDAS: {LAMBDAS}\n")
         f.write(f"MODEL_TYPE: {MODEL_TYPE}\n")
-        if MODEL_TYPE == "attention_fusion":
+        if MODEL_TYPE in ("attention_fusion", "ynet_attention_fusion"):
             f.write(f"PIXEL_INPUTS: {pixel_inputs}\n")
             f.write(f"PATCH_INPUTS: {patch_inputs}\n")
         else:
@@ -339,20 +347,22 @@ def main():
     n_classes = 4
 
     train_loader = DataLoader(
-        train_ds, 
-        batch_size=BATCH_SIZE, 
-        shuffle=True, 
+        train_ds,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
         num_workers=8,
         pin_memory=True,
-        persistent_workers=False
+        persistent_workers=False,
+        worker_init_fn=worker_init_fn,
     )
     val_loader = DataLoader(
-        val_ds, 
-        batch_size=BATCH_SIZE, 
+        val_ds,
+        batch_size=BATCH_SIZE,
         shuffle=False,
         num_workers=8,
         pin_memory=True,
-        persistent_workers=False
+        persistent_workers=False,
+        worker_init_fn=worker_init_fn,
     )
 
     print("--- 2. Model Init ---")
@@ -469,15 +479,16 @@ def main():
         # Proxy leaderboard score (higher = better), aligned to platform weights:
         #   mIoU_buildings 25%, mIoU_trees 15%, mIoU_water 15%,
         #   RMSE_building_height 25%, RMSE_vegetation_height 20%
-        # RMSE is converted to a 0-1 quality score: quality = 1 - RMSE / HEIGHT_NORM_CONSTANT
-        # (e.g. 3m RMSE → 0.90 quality, 6m → 0.80, 0m → 1.0)
+        # RMSE quality = max(0, 1 - RMSE / C), C=4.0 matches platform formula (C=3.9 reverse-engineered)
+        # Using C=HEIGHT_NORM_CONSTANT=30 was wrong: it made RMSE look irrelevant in checkpoint selection.
+        PROXY_C = 4.0
         iou_b = epoch_metrics[0].item()
         iou_v = epoch_metrics[1].item()
         iou_w = epoch_metrics[2].item()
         rmse_b = epoch_metrics[3].item()
         rmse_v = epoch_metrics[4].item()
-        rmse_b_quality = max(0.0, 1.0 - rmse_b / HEIGHT_NORM_CONSTANT)
-        rmse_v_quality = max(0.0, 1.0 - rmse_v / HEIGHT_NORM_CONSTANT)
+        rmse_b_quality = max(0.0, 1.0 - rmse_b / PROXY_C)
+        rmse_v_quality = max(0.0, 1.0 - rmse_v / PROXY_C)
         proxy_score = (0.25 * iou_b
                      + 0.15 * iou_v
                      + 0.15 * iou_w
