@@ -286,7 +286,8 @@ def main():
     p2 = os.path.join(exp_dir, "model_best.pth")
     model_path = p1 if os.path.exists(p1) else p2
 
-    predictions_dir = os.path.join(exp_dir, "predictions")
+    # TTA predictions go to a separate folder so the base predictions are never overwritten.
+    predictions_dir = os.path.join(exp_dir, "predictions_tta" if use_tta else "predictions")
     os.makedirs(predictions_dir, exist_ok=True)
 
     if model_type in ("attention_fusion", "ynet_attention_fusion"):
