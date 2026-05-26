@@ -70,27 +70,16 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Load a trained model and run inference on embeddings, saving predictions as .npy files."
     )
-    parser.add_argument("--experiment-name", type=str, default=EXPERIMENT_NAME)
-    parser.add_argument("--base-dir", type=str, default=BASE_DIR,
-                        help="Root directory containing experiment subfolders.")
-    parser.add_argument("--model-type", type=str, default="decoder_residual",
-                        choices=["auto", "lightunet", "decoder_residual", "attention_fusion"],
-                        help="Model architecture used during training.")
-    parser.add_argument("--model-path", type=str, default=None,
-                        help="Path to the .pth checkpoint. Defaults to <base-dir>/<experiment-name>/model_best_e1.pth or model_best.pth.")
-    parser.add_argument("--test-embeddings-dir", type=str, default=None, required=False,
-                        help="Directory containing embedding .tif files (for non-fusion models).")
-    parser.add_argument("--pixel-inputs", type=str, default="tessera",
-                        help="Comma-separated test pixel embeddings to concatenate (e.g. tessera,alpha_earth, or 'all').")
-    parser.add_argument("--patch-inputs", type=str, default="terramind_s1",
-                        help="Comma-separated test patch embeddings to concatenate (e.g. terramind_s1,thor_s2, or 'all').")
-    parser.add_argument("--predictions-dir", type=str, default=None,
-                        help="Output directory for .npy predictions. Defaults to <base-dir>/<experiment-name>/predictions.")
-    parser.add_argument("--patch-size", type=int, default=PATCH_SIZE)
-    parser.add_argument("--max-samples", type=int, default=MAX_SAMPLES,
-                        help="Limit inference to N samples (0 = all).")
-    parser.add_argument("--use-train-data", action="store_true",
-                        help="If set, uses training embeddings directories instead of test directories for friendly names.")
+    parser.add_argument("--experiment-name", type=str, required=True, help="Name of the experiment to predict.")
+    parser.add_argument("--pixel-inputs", type=str, default=None,
+                        help="Comma-separated pixel embeddings (e.g. alpha_earth). "
+                             "Overrides the value stored in training_params.txt.")
+    parser.add_argument("--patch-inputs", type=str, default=None,
+                        help="Comma-separated patch embeddings (e.g. terramind_s1,terramind_s2). "
+                             "Overrides the value stored in training_params.txt.")
+    parser.add_argument("--tta", action="store_true",
+                        help="Enable 8-fold Test-Time Augmentation (4 rotations × 2 flips). "
+                             "Averages predictions in logit space before sigmoid. No retraining needed.")
     return parser.parse_args()
 
 
@@ -114,12 +103,12 @@ def find_test_pairs(pixel_dirs, patch_dirs):
     pixel_maps = []
     for p_dir in pixel_dirs:
         files = glob.glob(os.path.join(p_dir, "**", "*.tif"), recursive=True)
-        pixel_maps.append({ _normalize_core_id(f): f for f in files })
+        pixel_maps.append({ extract_core_id_from_filename(f): f for f in files })
 
     patch_maps = []
     for p_dir in patch_dirs:
         files = glob.glob(os.path.join(p_dir, "**", "*.tif"), recursive=True)
-        patch_maps.append({ _normalize_core_id(f): f for f in files })
+        patch_maps.append({ extract_core_id_from_filename(f): f for f in files })
 
     common_ids = None
     for p_map in pixel_maps:
@@ -208,6 +197,58 @@ def process_multi_embeddings(pixel_paths, patch_paths, patch_size, scale_factor=
     return pixel_tensor, patch_tensor
 
 
+def tta_predict_dual(model, pixel_batch, patch_batch, device):
+    """
+    8-fold Test-Time Augmentation for dual-input models (ynet_attention_fusion / attention_fusion).
+    Applies all D4 symmetry transforms (4 rotations × 2 flips) to both pixel and patch inputs,
+    runs inference, applies the inverse transform to each output, then averages in RAW logit space
+    before the caller applies sigmoid. This is more principled than averaging sigmoid outputs.
+    """
+    preds = []
+    for k in range(4):          # rotations: 0°, 90°, 180°, 270°
+        for flip in (False, True):
+            p = torch.rot90(pixel_batch, k, dims=[-2, -1])
+            q = torch.rot90(patch_batch, k, dims=[-2, -1])
+            if flip:
+                p = torch.flip(p, dims=[-1])
+                q = torch.flip(q, dims=[-1])
+
+            out = model(p, q)   # raw logits, shape [1, 4, H, W]
+
+            # Invert the spatial transform on the output
+            if flip:
+                out = torch.flip(out, dims=[-1])
+            if k > 0:
+                out = torch.rot90(out, -k, dims=[-2, -1])
+
+            preds.append(out)
+
+    return torch.stack(preds).mean(dim=0)   # average in logit space
+
+
+def tta_predict_single(model, img_batch, device):
+    """
+    8-fold TTA for single-input models (decoder_residual, lightunet, etc.).
+    """
+    preds = []
+    for k in range(4):
+        for flip in (False, True):
+            x = torch.rot90(img_batch, k, dims=[-2, -1])
+            if flip:
+                x = torch.flip(x, dims=[-1])
+
+            out = model(x)
+
+            if flip:
+                out = torch.flip(out, dims=[-1])
+            if k > 0:
+                out = torch.rot90(out, -k, dims=[-2, -1])
+
+            preds.append(out)
+
+    return torch.stack(preds).mean(dim=0)
+
+
 def load_experiment_params(exp_dir):
     """Loads training parameters from training_params.txt in the experiment directory."""
     params_path = os.path.join(exp_dir, "training_params.txt")
@@ -223,41 +264,51 @@ def load_experiment_params(exp_dir):
 
 def main():
     args = parse_args()
-    exp_dir = os.path.join(args.base_dir, args.experiment_name)
+    exp_dir = os.path.join(config.SHARED_RUNS_DIR, args.experiment_name)
     params = load_experiment_params(exp_dir)
 
-    # Auto-detect parameters from training_params.txt if set to 'auto' or defaults
-    model_type = args.model_type.lower()
-    if model_type == "auto":
-        if "MODEL_TYPE" in params:
-            model_type = params["MODEL_TYPE"].lower()
-            print(f"🔄 Auto-detected model_type from training_params.txt: '{model_type}'")
-        else:
-            model_type = "decoder_residual"
-            print(f"⚠️ Could not auto-detect model_type. Falling back to default: '{model_type}'")
+    if not params:
+        raise RuntimeError(f"Could not find or load training_params.txt in {exp_dir}")
 
-    pixel_inputs = args.pixel_inputs
-    if "PIXEL_INPUTS" in params and args.pixel_inputs == "tessera":
-        pixel_inputs = params["PIXEL_INPUTS"]
-        print(f"🔄 Auto-detected pixel_inputs from training_params.txt: '{pixel_inputs}'")
+    model_type = params.get("MODEL_TYPE", "decoder_residual").lower()
+    # CLI args take priority; fall back to training_params.txt; empty string triggers fallback parser below
+    pixel_inputs = args.pixel_inputs or params.get("PIXEL_INPUTS", "")
+    patch_inputs = args.patch_inputs or params.get("PATCH_INPUTS", "")
+    patch_size = int(params.get("PATCH_SIZE", "256"))
 
-    patch_inputs = args.patch_inputs
-    if "PATCH_INPUTS" in params and args.patch_inputs == "terramind_s1":
-        patch_inputs = params["PATCH_INPUTS"]
-        print(f"🔄 Auto-detected patch_inputs from training_params.txt: '{patch_inputs}'")
+    use_tta = args.tta
+    print(f"🔄 Auto-detected config from training_params.txt:")
+    print(f"  Model: {model_type} | Patch Size: {patch_size} | TTA: {'ON (8-fold)' if use_tta else 'off'}")
+    if args.pixel_inputs or args.patch_inputs:
+        print(f"  (CLI override) pixel='{pixel_inputs}'  patch='{patch_inputs}'")
 
-    model_path = args.model_path
-    if model_path is None:
-        p1 = os.path.join(exp_dir, "model_best_e1.pth")
-        p2 = os.path.join(exp_dir, "model_best.pth")
-        model_path = p1 if os.path.exists(p1) else p2
+    p1 = os.path.join(exp_dir, "model_best_e1.pth")
+    p2 = os.path.join(exp_dir, "model_best.pth")
+    model_path = p1 if os.path.exists(p1) else p2
 
-    predictions_dir = args.predictions_dir or os.path.join(exp_dir, "predictions")
+    predictions_dir = os.path.join(exp_dir, "predictions")
     os.makedirs(predictions_dir, exist_ok=True)
 
-    if model_type == "attention_fusion":
-        pixel_dir_map = PIXEL_TRAIN_DIR_MAP if args.use_train_data else PIXEL_TEST_DIR_MAP
-        patch_dir_map = PATCH_TRAIN_DIR_MAP if args.use_train_data else PATCH_TEST_DIR_MAP
+    if model_type in ("attention_fusion", "ynet_attention_fusion"):
+        pixel_dir_map = PIXEL_TEST_DIR_MAP
+        patch_dir_map = PATCH_TEST_DIR_MAP
+
+        # Fallback: older ynet runs saved "Pixel:X_Patch:Y" in TRAIN_EMBEDDINGS_DIR
+        # instead of separate PIXEL_INPUTS / PATCH_INPUTS keys.
+        if not pixel_inputs or not patch_inputs:
+            combined = params.get("TRAIN_EMBEDDINGS_DIR", "")
+            import re as _re
+            m = _re.match(r"Pixel:(.+?)_Patch:(.+)", combined)
+            if m:
+                pixel_inputs = m.group(1).strip()
+                patch_inputs = m.group(2).strip()
+                print(f"  (Fallback) Parsed from TRAIN_EMBEDDINGS_DIR: pixel='{pixel_inputs}' patch='{patch_inputs}'")
+            else:
+                raise RuntimeError(
+                    f"Cannot determine pixel/patch inputs for model '{model_type}'. "
+                    f"Expected PIXEL_INPUTS and PATCH_INPUTS in training_params.txt, "
+                    f"or TRAIN_EMBEDDINGS_DIR in format 'Pixel:X_Patch:Y'. Got: '{combined}'"
+                )
 
         pixel_dirs = resolve_dirs(pixel_inputs, pixel_dir_map)
         patch_dirs = resolve_dirs(patch_inputs, patch_dir_map)
@@ -267,12 +318,9 @@ def main():
         if not test_pairs:
             raise RuntimeError("No matched pairs found. Check inputs.")
             
-        if args.max_samples > 0:
-            test_pairs = test_pairs[:args.max_samples]
-
         # Get channel dimensions dynamically
         pixel_tensor, patch_tensor = process_multi_embeddings(
-            test_pairs[0][1], test_pairs[0][2], args.patch_size
+            test_pairs[0][1], test_pairs[0][2], patch_size
         )
         pixel_channels = pixel_tensor.shape[0]
         patch_channels = patch_tensor.shape[0]
@@ -292,16 +340,23 @@ def main():
         print(f"Loaded model: {selected_model} from {model_path} (pixel channels={pixel_channels}, patch channels={patch_channels})")
 
         # --- Run inference ---
+        desc = "Predicting (TTA 8x)" if use_tta else "Predicting"
         print(f"Running inference on {len(test_pairs)} samples...")
         with torch.no_grad():
-            for core_id, pixel_paths, patch_paths in tqdm(test_pairs, desc="Predicting"):
-                pixel_tensor, patch_tensor = process_multi_embeddings(pixel_paths, patch_paths, args.patch_size)
-                
+            for core_id, pixel_paths, patch_paths in tqdm(test_pairs, desc=desc):
+                pixel_tensor, patch_tensor = process_multi_embeddings(pixel_paths, patch_paths, patch_size)
+
                 pixel_batch = pixel_tensor.unsqueeze(0).to(DEVICE)
                 patch_batch = patch_tensor.unsqueeze(0).to(DEVICE)
 
-                output_batch = model(pixel_batch, patch_batch)
-                pred_np = output_batch.squeeze().cpu().numpy().astype(np.float32)
+                if use_tta:
+                    output_batch = tta_predict_dual(model, pixel_batch, patch_batch, DEVICE)
+                else:
+                    output_batch = model(pixel_batch, patch_batch)
+
+                preds = output_batch.squeeze()
+                preds[:3] = torch.sigmoid(preds[:3])
+                pred_np = preds.cpu().numpy().astype(np.float32)
 
                 # Denormalize height channel: model output [0,1] -> physical meters
                 pred_np[3] = pred_np[3] * HEIGHT_NORM_CONSTANT
@@ -310,31 +365,19 @@ def main():
                 np.save(save_path, pred_np)
 
     else:
-        # Resolve test/train directory using config.py if not specified
-        if args.test_embeddings_dir is None:
-            if args.use_train_data:
-                if model_type == "lightunet":
-                    test_embeddings_dir = config.TESSERA_DIR
-                else:
-                    test_embeddings_dir = config.TERRAMIND_S1_DIR
-            else:
-                if model_type == "lightunet":
-                    test_embeddings_dir = config.TESSERA_TEST_DIR
-                else:
-                    test_embeddings_dir = config.TERRAMIND_S1_TEST_DIR
+        # Resolve test/train directory using config.py
+        if model_type == "lightunet":
+            test_embeddings_dir = config.TESSERA_TEST_DIR
         else:
-            test_embeddings_dir = args.test_embeddings_dir
+            test_embeddings_dir = config.TERRAMIND_S1_TEST_DIR
 
         print(f"Loading embedding files from: {test_embeddings_dir}")
         emb_files = glob.glob(os.path.join(test_embeddings_dir, "**", "*.tif"), recursive=True)
         if not emb_files:
             raise RuntimeError(f"No .tif files found in test_embeddings_dir='{test_embeddings_dir}'.")
             
-        if args.max_samples > 0:
-            emb_files = emb_files[:args.max_samples]
-
         # Process the first embedding just to get the number of channels dynamically
-        sample_tensor = process_embedding(emb_files[0], model_type, args.patch_size)
+        sample_tensor = process_embedding(emb_files[0], model_type, patch_size)
         n_channels = sample_tensor.shape[0]
 
         # --- Load model ---
@@ -345,14 +388,21 @@ def main():
         print(f"Loaded model: {selected_model} from {model_path} (input channels={n_channels})")
 
         # --- Run inference ---
+        desc = "Predicting (TTA 8x)" if use_tta else "Predicting"
         print(f"Running inference on {len(emb_files)} samples...")
         with torch.no_grad():
-            for emb_path in tqdm(emb_files, desc="Predicting"):
-                img_tensor = process_embedding(emb_path, model_type, args.patch_size)
+            for emb_path in tqdm(emb_files, desc=desc):
+                img_tensor = process_embedding(emb_path, model_type, patch_size)
                 img_batch = img_tensor.unsqueeze(0).to(DEVICE)
 
-                output_batch = model(img_batch)
-                pred_np = output_batch.squeeze().cpu().numpy().astype(np.float32)
+                if use_tta:
+                    output_batch = tta_predict_single(model, img_batch, DEVICE)
+                else:
+                    output_batch = model(img_batch)
+
+                preds = output_batch.squeeze()
+                preds[:3] = torch.sigmoid(preds[:3])
+                pred_np = preds.cpu().numpy().astype(np.float32)
 
                 # Denormalize height channel: model output [0,1] -> physical meters
                 pred_np[3] = pred_np[3] * HEIGHT_NORM_CONSTANT
