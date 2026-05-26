@@ -88,11 +88,14 @@ def upload_submission():
             # Target strictly a <button> or <a> element whose exact visible text is 'NEW'
             new_btn = page.locator("button:has-text('NEW'), a:has-text('NEW')").first
             new_btn.wait_for(state="visible", timeout=30000)
-            new_btn.click()
+            new_btn.click(force=True, timeout=15000)
             print("✅ Clicked 'NEW' button!")
         except Exception as e:
             print(f"❌ Could not find or click the 'NEW' button: {e}")
-            page.screenshot(path="dashboard_error.png", full_page=True)
+            try:
+                page.screenshot(path="dashboard_error.png", full_page=True)
+            except Exception:
+                pass
             browser.close()
             return
 
