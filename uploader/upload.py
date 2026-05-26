@@ -16,13 +16,23 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Upload a competition submission zip directly to the ESA platform.")
     parser.add_argument("--experiment-name", type=str, required=True,
                         help="Name of the experiment (must match the run folder and zip created by submit.py).")
+    parser.add_argument("--tta", action="store_true",
+                        help="Upload the TTA zip (submission_<name>_tta.zip) instead of the base zip.")
+    parser.add_argument("--zip-file", type=str, default=None,
+                        help="Optional explicit path to the zip file to upload. "
+                             "Overrides the default naming derived from --experiment-name and --tta.")
     return parser.parse_args()
 
 
 def upload_submission():
     args = parse_args()
     exp_dir = os.path.join(config.SHARED_RUNS_DIR, args.experiment_name)
-    FILE_PATH = os.path.join(exp_dir, f"submission_{args.experiment_name}.zip")
+
+    if args.zip_file:
+        FILE_PATH = args.zip_file
+    else:
+        suffix = "_tta" if args.tta else ""
+        FILE_PATH = os.path.join(exp_dir, f"submission_{args.experiment_name}{suffix}.zip")
 
     if not os.path.exists(FILE_PATH):
         print(f"❌ Error: Submission file not found at {FILE_PATH}")
@@ -40,6 +50,12 @@ def upload_submission():
                 print(f"Loading session cookies from {COOKIES_FILE}...")
                 with open(COOKIES_FILE, "r") as f:
                     cookies = json.load(f)
+                # Playwright requires sameSite to be exactly "Strict", "Lax", or "None".
+                # EditThisCookie exports lowercase ("lax") and "unspecified" — normalise in-memory.
+                _samesite_map = {"strict": "Strict", "lax": "Lax", "none": "None", "unspecified": "Lax"}
+                for cookie in cookies:
+                    raw = cookie.get("sameSite", "Lax")
+                    cookie["sameSite"] = _samesite_map.get(raw.lower(), "Lax")
                 context.add_cookies(cookies)
             else:
                 print(f"⚠️ Warning: USE_COOKIES is True but {COOKIES_FILE} is missing. Continuing without cookies.")
