@@ -101,8 +101,11 @@ def upload_submission():
 
         # Give the modal animation time to complete
         page.wait_for_timeout(3000)
-        page.screenshot(path="after_new_click.png", full_page=True)
-        print("📸 Saved 'after_new_click.png' for debugging.")
+        try:
+            page.screenshot(path="after_new_click.png", full_page=True)
+            print("📸 Saved 'after_new_click.png' for debugging.")
+        except Exception:
+            print("⚠️  Debug screenshot skipped (font/render timeout).")
 
         # --- Step 2: Fill Name and Description using JavaScript ---
         # Playwright found the elements but reported them as "not visible".
@@ -166,14 +169,20 @@ def upload_submission():
             print("✅ File attached successfully.")
         except Exception as e:
             print(f"❌ Failed to attach file: {e}")
-            page.screenshot(path="file_attach_error.png", full_page=True)
+            try:
+                page.screenshot(path="file_attach_error.png", full_page=True)
+            except Exception:
+                pass
             browser.close()
             return
 
         # Give React time to validate the form and reveal the Submit button
         page.wait_for_timeout(2000)
-        page.screenshot(path="before_submit.png", full_page=True)
-        print("📸 Saved 'before_submit.png' for debugging.")
+        try:
+            page.screenshot(path="before_submit.png", full_page=True)
+            print("📸 Saved 'before_submit.png' for debugging.")
+        except Exception:
+            print("⚠️  Debug screenshot skipped.")
 
         # --- Step 4: Click Submit and intercept the network response ---
         print("🚀 Triggering final submission...")
@@ -201,11 +210,17 @@ def upload_submission():
 
             if response.status in (200, 201, 204):
                 print("✅ SUCCESS! Server confirmed the submission was received!")
-                page.screenshot(path="upload_success.png", full_page=True)
-                print("📸 Saved 'upload_success.png'")
+                try:
+                    page.screenshot(path="upload_success.png", full_page=True)
+                    print("📸 Saved 'upload_success.png'")
+                except Exception:
+                    pass
             else:
                 print(f"⚠️  Unexpected status {response.status}. Check 'upload_response_error.png'")
-                page.screenshot(path="upload_response_error.png", full_page=True)
+                try:
+                    page.screenshot(path="upload_response_error.png", full_page=True)
+                except Exception:
+                    pass
 
             # Now click "Close" to cleanly dismiss the dialog
             print("Closing the submission dialog...")
@@ -218,8 +233,11 @@ def upload_submission():
 
         except Exception as e:
             print(f"\n❌ Upload process failed: {e}")
-            page.screenshot(path="upload_failure_debug.png", full_page=True)
-            print("Saved debug screenshot to 'upload_failure_debug.png'")
+            try:
+                page.screenshot(path="upload_failure_debug.png", full_page=True)
+                print("Saved debug screenshot to 'upload_failure_debug.png'")
+            except Exception:
+                pass
         finally:
             print("Closing browser context.")
             browser.close()
