@@ -8,12 +8,14 @@ import config
 def parse_args():
     parser = argparse.ArgumentParser(description="Package predictions into a competition-ready zip file.")
     parser.add_argument("--experiment-name", type=str, required=True, help="Name of the experiment to package.")
+    parser.add_argument("--tta", action="store_true",
+                        help="Package TTA predictions (from predictions_tta/) instead of base predictions.")
     return parser.parse_args()
 
 def main():
     args = parse_args()
     exp_dir = os.path.join(config.SHARED_RUNS_DIR, args.experiment_name)
-    predictions_dir = os.path.join(exp_dir, "predictions")
+    predictions_dir = os.path.join(exp_dir, "predictions_tta" if args.tta else "predictions")
 
     if not os.path.exists(predictions_dir):
         raise RuntimeError(f"Predictions directory not found: {predictions_dir}. Please run predict.py first.")
@@ -35,7 +37,8 @@ def main():
         )
     print(f"✅ Shape validation passed: {sample_npy.shape}")
 
-    zip_filename = os.path.join(exp_dir, f"submission_{args.experiment_name}.zip")
+    suffix = "_tta" if args.tta else ""
+    zip_filename = os.path.join(exp_dir, f"submission_{args.experiment_name}{suffix}.zip")
     print(f"🤐 Zipping results to {zip_filename} ...")
 
     # Platform-Compliant Zipping with internal 'predictions/' folder
