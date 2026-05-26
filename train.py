@@ -22,7 +22,7 @@ from core.dataset import (
     find_triple_file_pairs,
     HEIGHT_NORM_CONSTANT
 )
-from core.losses import ImprovedCompositeLoss
+from core.losses import CompositeLossWithVegBoost, MSEVegBoostLoss, MSESigmaLoss
 
 # --- 1. EXPERIMENT TRACKING ---
 EXPERIMENT_NAME = "terramid_run02/"
@@ -62,6 +62,19 @@ torch.manual_seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
 random.seed(RANDOM_SEED)
 
+# Platform proxy constant (≈ leaderboard C=3.9; use 4.0 for checkpoint selection)
+PROXY_C = 4.0
+LOSS_MODE = "composite"
+
+from torch.utils.data import get_worker_info as _get_worker_info
+
+
+def worker_init_fn(worker_id):
+    """Per-worker numpy seed so augmentation randomness is independent across workers."""
+    info = _get_worker_info()
+    seed = info.seed % (2 ** 32)
+    np.random.seed(seed)
+
 
 PIXEL_DIR_MAP = {
     "tessera": config.TESSERA_DIR,
@@ -92,7 +105,7 @@ def resolve_dirs(input_str, name_map):
     return paths
 
 
-def save_experiment_config(pixel_inputs=None, patch_inputs=None):
+def save_experiment_config(pixel_inputs=None, patch_inputs=None, loss_mode="composite"):
     """Logs all hyperparameters to a text file in the experiment folder."""
     os.makedirs(EXP_DIR, exist_ok=True)
     os.makedirs(VIZ_OUTPUT_DIR, exist_ok=True)
@@ -105,9 +118,9 @@ def save_experiment_config(pixel_inputs=None, patch_inputs=None):
         f.write(f"EPOCHS: {EPOCHS}\n")
         f.write(f"LEARNING_RATE: {LEARNING_RATE}\n")
         f.write(f"WEIGHT_DECAY: {WEIGHT_DECAY}\n")
-        f.write(f"LOSS LAMBDAS: {LAMBDAS}\n")
         f.write(f"MODEL_TYPE: {MODEL_TYPE}\n")
-        if MODEL_TYPE == "attention_fusion":
+        f.write(f"LOSS_MODE: {loss_mode}\n")
+        if pixel_inputs is not None:
             f.write(f"PIXEL_INPUTS: {pixel_inputs}\n")
             f.write(f"PATCH_INPUTS: {patch_inputs}\n")
         else:
@@ -134,6 +147,9 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=EPOCHS)
     parser.add_argument("--num-workers", type=int, default=8, help="Number of worker processes for DataLoader.")
     parser.add_argument("--cache-in-memory", action="store_true", help="Cache dataset samples in CPU RAM on first load to speed up subsequent epochs.")
+    parser.add_argument("--loss-mode", type=str, default="composite",
+                        choices=["composite", "mse", "mse_sigma"],
+                        help="Loss function: composite=CompositeLossWithVegBoost, mse=MSEVegBoostLoss, mse_sigma=MSEVegBoostLoss+Kendall sigma.")
     return parser.parse_args()
 
 
@@ -229,7 +245,7 @@ def main():
     global BASE_DIR, EXPERIMENT_NAME, EXP_DIR, VIZ_OUTPUT_DIR
     global BEST_MODEL_PATH, LAST_MODEL_PATH, LOSS_CURVE_PATH, CONFIG_LOG_PATH
     global TRAIN_EMBEDDINGS_DIR, TRAIN_TARGETS_DIR, TEST_TARGETS_DIR
-    global MODEL_TYPE, EPOCHS, BATCH_SIZE, PATCH_SIZE
+    global MODEL_TYPE, EPOCHS, BATCH_SIZE, PATCH_SIZE, LOSS_MODE
 
     args = parse_args()
     MODEL_TYPE = args.model_type
@@ -238,6 +254,7 @@ def main():
     BATCH_SIZE = args.batch_size
     PATCH_SIZE = args.patch_size
     EPOCHS = args.epochs
+    LOSS_MODE = args.loss_mode
 
     # Resolve directories using config.py
     if MODEL_TYPE == "attention_fusion":
@@ -274,9 +291,9 @@ def main():
     CONFIG_LOG_PATH = os.path.join(EXP_DIR, "training_params.txt")
 
     if MODEL_TYPE == "attention_fusion":
-        save_experiment_config(pixel_inputs=args.pixel_inputs, patch_inputs=args.patch_inputs)
+        save_experiment_config(pixel_inputs=args.pixel_inputs, patch_inputs=args.patch_inputs, loss_mode=LOSS_MODE)
     else:
-        save_experiment_config()
+        save_experiment_config(loss_mode=LOSS_MODE)
 
     print("--- 1. Data Setup ---")
     if MODEL_TYPE == "attention_fusion":
@@ -334,20 +351,22 @@ def main():
     n_classes = 4
 
     train_loader = DataLoader(
-        train_ds, 
-        batch_size=BATCH_SIZE, 
-        shuffle=True, 
-        num_workers=8,
+        train_ds,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=args.num_workers,
         pin_memory=True,
-        persistent_workers=False
+        persistent_workers=False,
+        worker_init_fn=worker_init_fn,
     )
     val_loader = DataLoader(
-        val_ds, 
-        batch_size=BATCH_SIZE, 
+        val_ds,
+        batch_size=BATCH_SIZE,
         shuffle=False,
-        num_workers=8,
+        num_workers=args.num_workers,
         pin_memory=True,
-        persistent_workers=False
+        persistent_workers=False,
+        worker_init_fn=worker_init_fn,
     )
 
     print("--- 2. Model Init ---")
@@ -355,17 +374,28 @@ def main():
     model = model.to(DEVICE)
     print(f"Using model: {selected_model} (pixel channels={pixel_channels}, patch channels={patch_channels})")
 
-    # NEW: AdamW with Weight Decay
-    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    # Instantiate loss based on --loss-mode
+    if LOSS_MODE == "mse":
+        criterion = MSEVegBoostLoss().to(DEVICE)
+        print(f"Loss: MSEVegBoostLoss (pure MSE + build/veg height boosts)")
+    elif LOSS_MODE == "mse_sigma":
+        criterion = MSESigmaLoss().to(DEVICE)
+        print(f"Loss: MSESigmaLoss (MSE + Kendall uncertainty σ, learnable log_vars)")
+    else:
+        criterion = CompositeLossWithVegBoost().to(DEVICE)
+        print(f"Loss: CompositeLossWithVegBoost (MAE+SSIM+GDL+Tversky + build/veg boosts)")
 
-    # NEW: Aggressive Scheduler
+    # AdamW — include criterion.parameters() so σ log_vars train for mse_sigma
+    opt_params = list(model.parameters()) + list(criterion.parameters())
+    optimizer = optim.AdamW(opt_params, lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+
+    # Aggressive LR Scheduler
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
-    criterion = ImprovedCompositeLoss(lambdas=LAMBDAS).to(DEVICE)
 
     print(f"Starting training on {DEVICE}...")
 
     train_losses, val_losses = [], []
-    best_val_score = float('inf')
+    best_val_score = 0.0          # platform proxy: higher is better
     best_epoch = 0
     best_metrics = None
     epoch_times = []
@@ -396,8 +426,8 @@ def main():
             loss, _, _, _, _ = criterion(outputs, targets)
             loss.backward()
 
-            # NEW: Gradient Clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # Gradient Clipping (includes criterion.parameters() for mse_sigma log_vars)
+            torch.nn.utils.clip_grad_norm_(opt_params, max_norm=1.0)
 
             optimizer.step()
             running_loss += loss.item() * batch_size
@@ -457,16 +487,24 @@ def main():
 
         scheduler.step(epoch_val_loss)
 
-        val_mae = epoch_comp[0].item()
-        val_tversky = epoch_comp[3].item()
-        val_score = val_mae + (val_tversky * 2.0)
+        # Platform-aligned proxy score (C=PROXY_C ≈ 3.9); higher is better
+        m_iou_b  = epoch_metrics[0].item()
+        m_iou_v  = epoch_metrics[1].item()
+        m_iou_w  = epoch_metrics[2].item()
+        m_rmse_b = epoch_metrics[3].item()
+        m_rmse_v = epoch_metrics[4].item()
+        val_score = (
+            0.25 * m_iou_b + 0.15 * m_iou_v + 0.15 * m_iou_w +
+            0.25 * max(0.0, 1.0 - m_rmse_b / PROXY_C) +
+            0.20 * max(0.0, 1.0 - m_rmse_v / PROXY_C)
+        )
 
-        if val_score < best_val_score:
+        if val_score > best_val_score:
             best_val_score = val_score
             best_epoch = epoch + 1
             best_metrics = epoch_metrics
             torch.save(model.state_dict(), BEST_MODEL_PATH)
-            print(f"   >> [Checkpoint] New best model saved! (Score: {val_score:.4f} | MAE: {val_mae:.4f} | Tversky: {val_tversky:.4f})")
+            print(f"   >> [Checkpoint] New best model saved! (Proxy: {val_score:.4f} | IoU_B: {m_iou_b:.4f} | RMSE_B: {m_rmse_b:.4f} | RMSE_V: {m_rmse_v:.4f})")
 
         epoch_elapsed = time.time() - epoch_start_time
         epoch_times.append(epoch_elapsed)
@@ -495,7 +533,7 @@ def main():
         summary_msg = (
             f"\n=== BEST MODEL SUMMARY ===\n"
             f"Best Epoch: {best_epoch}\n"
-            f"Best Val Score (Tversky + 2*MAE): {best_val_score:.4f}\n"
+            f"Best Proxy Score (C={PROXY_C}): {best_val_score:.4f}\n"
             f"Leaderboard Metrics at Best Epoch -> IOU_B: {best_metrics[0]:.4f} | IOU_V: {best_metrics[1]:.4f} | IOU_W: {best_metrics[2]:.4f} | RMSE_B: {best_metrics[3]:.4f} | RMSE_V: {best_metrics[4]:.4f}\n"
         )
         print(summary_msg, end="")

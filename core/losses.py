@@ -19,12 +19,10 @@ class TverskyLoss(nn.Module):
         self.smooth = smooth
 
     def forward(self, preds, targets):
-        # Flatten: [Batch, H, W] -> [Batch, N]
         batch_size = preds.size(0)
         p = preds.view(batch_size, -1)
         t = targets.view(batch_size, -1)
 
-        # True Positives, False Positives, False Negatives
         TP = torch.sum(p * t, dim=1)
         FP = torch.sum(p * (1 - t), dim=1)
         FN = torch.sum((1 - p) * t, dim=1)
@@ -114,48 +112,39 @@ class SSIMLoss(nn.Module):
         return 1 - self._ssim(img1, img2, window, self.window_size, channel, self.size_average)
 
 
-class ImprovedCompositeLoss(nn.Module):
+class CompositeLossWithVegBoost(nn.Module):
     """
-    Combined Recipe:
-    1. Split Foreground/Background MAE (L1).
-    2. SSIM and Gradient Loss on RGB channels.
-    3. Tversky Loss specifically to boost Building recall.
-    4. Structure-Boosted Height MAE.
+    ImprovedCompositeLoss + vegetation height boost.
+
+    Recipe:
+    1. Split Foreground/Background weighted MAE (buildings & water weighted 3×).
+    2. SSIM and Gradient Loss on abundance channels.
+    3. Multi-class Tversky Loss (buildings & water weighted higher).
+    4. Building-masked height MAE boost.
+    5. Vegetation-masked height MAE boost.
+
+    Returns: (total_loss, loss_mae, loss_ssim, loss_grad, loss_tversky)
     """
 
-    def __init__(self, lambdas=[1.0, 0.5, 0.5, 2.0], bg_weight=0.05):
+    def __init__(self, lambdas=None, bg_weight=0.05):
         super().__init__()
         self.ssim = SSIMLoss(window_size=11)
         self.gdl = GradientDifferenceLoss()
-
-        # Using Tversky instead of Jaccard to heavily penalize missing buildings
         self.tversky = TverskyLoss(alpha=0.3, beta=0.7)
-
-        self.w_mae = lambdas[0]
-        self.w_ssim = lambdas[1]
-        self.w_grad = lambdas[2]
-        self.w_structure = lambdas[3]  # Represents both Tversky and Building-Height weights
-
         self.bg_weight = bg_weight
+        # lambdas kept for API compat but actual weights are hardcoded below
 
-        # Height is now normalized, so we weight all 4 channels equally in base MAE
-        self.mae_weights = torch.tensor([1.0, 1.0, 1.0, 1.0]).float()
-    def forward(self, preds, targets):
+    def forward(self, preds, targets, **kwargs):
         device = preds.device
 
-        # --- 1. CRITICAL FIX: LOGIT TO PROBABILITY CONVERSION ---
-        # Convert Abundance logits (Ch 0, 1, 2) to [0, 1] probabilities. 
-        # Keep Height (Ch 3) strictly linear.
         preds_abund = torch.sigmoid(preds[:, :3, :, :])
         preds_height = preds[:, 3:4, :, :]
-        
         target_abund = targets[:, :3, :, :]
         target_height = targets[:, 3:4, :, :]
 
-        # Re-concatenate for the base MAE function
         preds_norm = torch.cat([preds_abund, preds_height], dim=1)
 
-        # --- 2. Base MAE (Foreground / Background Split) ---
+        # --- Foreground/Background weighted MAE ---
         abs_err = torch.abs(preds_norm - targets)
         fg_mask = (targets > 0).float()
         bg_mask = 1.0 - fg_mask
@@ -165,41 +154,152 @@ class ImprovedCompositeLoss(nn.Module):
 
         mae_fg = torch.sum(abs_err * fg_mask, dim=(0, 2, 3)) / fg_sum
         mae_bg = torch.sum(abs_err * bg_mask, dim=(0, 2, 3)) / bg_sum
-
         mae_per_channel = mae_fg + (self.bg_weight * mae_bg)
-        
-        # NEW BALANCE: Heavily penalize Building (0) and Water (2) errors
+
+        # Heavily penalize building (ch 0) and water (ch 2) errors
         mae_weights = torch.tensor([3.0, 1.0, 3.0, 1.0]).to(device)
         loss_mae = torch.sum(mae_per_channel * mae_weights)
 
-        # --- 3. Structural & Gradient Loss ---
-        # Now safely using valid [0,1] probabilities
+        # --- Structural & Gradient Loss ---
         loss_ssim = self.ssim(preds_abund, target_abund)
         loss_grad = self.gdl(preds_abund, target_abund)
 
-        # --- 4. Multi-Class Tversky Loss ---
-        # Removed the broken ReLU. Using clean probabilities.
+        # --- Multi-Class Tversky ---
         t_build = self.tversky(preds_abund[:, 0, :, :], target_abund[:, 0, :, :])
-        t_veg = self.tversky(preds_abund[:, 1, :, :], target_abund[:, 1, :, :])
+        t_veg   = self.tversky(preds_abund[:, 1, :, :], target_abund[:, 1, :, :])
         t_water = self.tversky(preds_abund[:, 2, :, :], target_abund[:, 2, :, :])
-
-        # Weight Building and Water Tversky higher than Vegetation
         loss_tversky = (2.0 * t_build + 0.5 * t_veg + 2.0 * t_water) / 4.5
 
-        # --- 5. Height-Aware Building Masking ---
-        build_presence_mask = (target_abund[:, 0, :, :] > 0.1).float()
+        # --- Height Boost: buildings ---
         height_err = torch.abs(preds_height - target_height)
-        
-        # Cleanly penalize height errors specifically on physical structures
-        # Averaged only over the pixels where buildings actually exist
-        loss_height_boost = torch.sum(height_err * build_presence_mask) / (torch.sum(build_presence_mask) + 1e-6)
+        build_mask = (target_abund[:, 0, :, :].detach() > 0.1).float()
+        loss_height_boost = (
+            torch.sum(height_err * build_mask) / (build_mask.sum() + 1e-6)
+        )
 
-        # --- Combine Total Loss ---
-        # Hardcoding the lambdas here for safety to prevent config overrides
-        total_loss = (1.0 * loss_mae) + \
-                     (0.5 * loss_ssim) + \
-                     (0.5 * loss_grad) + \
-                     (2.0 * loss_tversky) + \
-                     (1.0 * loss_height_boost)
+        # --- Height Boost: vegetation ---
+        veg_mask = (target_abund[:, 1, :, :].detach() > 0.1).float()
+        loss_veg_boost = (
+            torch.sum(height_err * veg_mask) / (veg_mask.sum() + 1e-6)
+        )
+
+        total_loss = (
+            1.0 * loss_mae +
+            0.5 * loss_ssim +
+            0.5 * loss_grad +
+            2.0 * loss_tversky +
+            1.0 * loss_height_boost +
+            1.0 * loss_veg_boost
+        )
 
         return total_loss, loss_mae, loss_ssim, loss_grad, loss_tversky
+
+
+class MSEVegBoostLoss(nn.Module):
+    """
+    Pure MSE for abundance channels + masked MAE for height.
+
+    Rationale: abundance targets are continuous fractions (0–1), not binary.
+    MSE is better calibrated for fractional outputs evaluated via hard-IoU-at-0.5.
+    Height is trained with a base MAE plus two region-specific boosts:
+      - building-masked boost (recover tall structure height)
+      - vegetation-masked boost (recover tree canopy / vegetation height)
+
+    Returns: (total_loss, loss_mse, zeros×3)
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, preds, targets, **kwargs):
+        preds_abund = torch.sigmoid(preds[:, :3, :, :])
+        preds_height = preds[:, 3:4, :, :]
+        target_abund = targets[:, :3, :, :]
+        target_height = targets[:, 3:4, :, :]
+
+        # Task 1: abundance MSE
+        loss_mse = F.mse_loss(preds_abund, target_abund)
+
+        # Task 2: height base MAE
+        height_err = torch.abs(preds_height - target_height)
+        loss_height_base = height_err.mean()
+
+        # Task 3: building-masked height boost
+        build_mask = (target_abund[:, 0, :, :].detach() > 0.1).float()
+        loss_build_boost = (
+            torch.sum(height_err.squeeze(1) * build_mask) /
+            (build_mask.sum() + 1e-6)
+        )
+
+        # Task 4: vegetation-masked height boost
+        veg_mask = (target_abund[:, 1, :, :].detach() > 0.1).float()
+        loss_veg_boost = (
+            torch.sum(height_err.squeeze(1) * veg_mask) /
+            (veg_mask.sum() + 1e-6)
+        )
+
+        total = loss_mse + loss_height_base + loss_build_boost + loss_veg_boost
+
+        _zero = torch.zeros(1, device=preds.device)
+        return total, loss_mse, _zero, _zero, _zero
+
+
+class MSESigmaLoss(nn.Module):
+    """
+    MSEVegBoostLoss + Kendall uncertainty weighting (Kendall et al., 2018).
+
+    Four learnable log-variance parameters (one per sub-task) are trained jointly
+    with the model. The total loss is:
+        L = Σ_i [ exp(-log_var_i) * L_i + log_var_i ]
+    This automatically balances the four sub-tasks without manual lambda tuning.
+
+    NOTE: the optimizer must include list(criterion.parameters()) so the
+    log_vars are updated alongside the model weights.
+
+    Returns: (total_loss, loss_mse, zeros×3)
+    """
+
+    def __init__(self):
+        super().__init__()
+        # log_vars for: [abundance_mse, height_base, build_boost, veg_boost]
+        self.log_vars = nn.Parameter(torch.zeros(4))
+
+    def forward(self, preds, targets, **kwargs):
+        preds_abund = torch.sigmoid(preds[:, :3, :, :])
+        preds_height = preds[:, 3:4, :, :]
+        target_abund = targets[:, :3, :, :]
+        target_height = targets[:, 3:4, :, :]
+
+        # Task 0: abundance MSE
+        loss_mse = F.mse_loss(preds_abund, target_abund)
+
+        # Task 1: height base MAE
+        height_err = torch.abs(preds_height - target_height)
+        loss_height_base = height_err.mean()
+
+        # Task 2: building-masked height boost
+        build_mask = (target_abund[:, 0, :, :].detach() > 0.1).float()
+        loss_build_boost = (
+            torch.sum(height_err.squeeze(1) * build_mask) /
+            (build_mask.sum() + 1e-6)
+        )
+
+        # Task 3: vegetation-masked height boost
+        veg_mask = (target_abund[:, 1, :, :].detach() > 0.1).float()
+        loss_veg_boost = (
+            torch.sum(height_err.squeeze(1) * veg_mask) /
+            (veg_mask.sum() + 1e-6)
+        )
+
+        raw_losses = [loss_mse, loss_height_base, loss_build_boost, loss_veg_boost]
+        total = sum(
+            torch.exp(-self.log_vars[i]) * l + self.log_vars[i]
+            for i, l in enumerate(raw_losses)
+        )
+
+        _zero = torch.zeros(1, device=preds.device)
+        return total, loss_mse, _zero, _zero, _zero
+
+
+# Alias for backward compatibility
+ImprovedCompositeLoss = CompositeLossWithVegBoost
