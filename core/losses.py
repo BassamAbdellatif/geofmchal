@@ -170,17 +170,18 @@ class CompositeLossWithVegBoost(nn.Module):
         t_water = self.tversky(preds_abund[:, 2, :, :], target_abund[:, 2, :, :])
         loss_tversky = (2.0 * t_build + 0.5 * t_veg + 2.0 * t_water) / 4.5
 
-        # --- Height Boost: buildings ---
-        height_err = torch.abs(preds_height - target_height)
+        # --- Height Boost: buildings & vegetation ---
+        # Use squared error (MSE) not MAE so gradients push outliers down —
+        # directly aligned with the platform's RMSE evaluation metric.
+        height_err_sq = (preds_height - target_height) ** 2
         build_mask = (target_abund[:, 0, :, :].detach() > 0.1).float()
         loss_height_boost = (
-            torch.sum(height_err * build_mask) / (build_mask.sum() + 1e-6)
+            torch.sum(height_err_sq * build_mask) / (build_mask.sum() + 1e-6)
         )
 
-        # --- Height Boost: vegetation ---
         veg_mask = (target_abund[:, 1, :, :].detach() > 0.1).float()
         loss_veg_boost = (
-            torch.sum(height_err * veg_mask) / (veg_mask.sum() + 1e-6)
+            torch.sum(height_err_sq * veg_mask) / (veg_mask.sum() + 1e-6)
         )
 
         total_loss = (
@@ -220,21 +221,20 @@ class MSEVegBoostLoss(nn.Module):
         # Task 1: abundance MSE
         loss_mse = F.mse_loss(preds_abund, target_abund)
 
-        # Task 2: height base MAE
-        height_err = torch.abs(preds_height - target_height)
-        loss_height_base = height_err.mean()
+        # Tasks 2-4: height losses using squared error — directly aligned with
+        # the platform's RMSE evaluation metric (MSE minimizer = RMSE minimizer).
+        height_err_sq = (preds_height - target_height) ** 2
+        loss_height_base = height_err_sq.mean()
 
-        # Task 3: building-masked height boost
         build_mask = (target_abund[:, 0, :, :].detach() > 0.1).float()
         loss_build_boost = (
-            torch.sum(height_err.squeeze(1) * build_mask) /
+            torch.sum(height_err_sq.squeeze(1) * build_mask) /
             (build_mask.sum() + 1e-6)
         )
 
-        # Task 4: vegetation-masked height boost
         veg_mask = (target_abund[:, 1, :, :].detach() > 0.1).float()
         loss_veg_boost = (
-            torch.sum(height_err.squeeze(1) * veg_mask) /
+            torch.sum(height_err_sq.squeeze(1) * veg_mask) /
             (veg_mask.sum() + 1e-6)
         )
 
@@ -273,21 +273,20 @@ class MSESigmaLoss(nn.Module):
         # Task 0: abundance MSE
         loss_mse = F.mse_loss(preds_abund, target_abund)
 
-        # Task 1: height base MAE
-        height_err = torch.abs(preds_height - target_height)
-        loss_height_base = height_err.mean()
+        # Tasks 1-3: height losses using squared error — directly aligned with
+        # the platform's RMSE evaluation metric.
+        height_err_sq = (preds_height - target_height) ** 2
+        loss_height_base = height_err_sq.mean()
 
-        # Task 2: building-masked height boost
         build_mask = (target_abund[:, 0, :, :].detach() > 0.1).float()
         loss_build_boost = (
-            torch.sum(height_err.squeeze(1) * build_mask) /
+            torch.sum(height_err_sq.squeeze(1) * build_mask) /
             (build_mask.sum() + 1e-6)
         )
 
-        # Task 3: vegetation-masked height boost
         veg_mask = (target_abund[:, 1, :, :].detach() > 0.1).float()
         loss_veg_boost = (
-            torch.sum(height_err.squeeze(1) * veg_mask) /
+            torch.sum(height_err_sq.squeeze(1) * veg_mask) /
             (veg_mask.sum() + 1e-6)
         )
 
