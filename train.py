@@ -463,10 +463,10 @@ def main():
                 loss, l_mae, l_ssim, l_grad, l_tversky = criterion(outputs, targets)
                 val_running_loss += loss.item() * batch_size
 
-                val_components[0] += l_mae * batch_size
-                val_components[1] += l_ssim * batch_size
-                val_components[2] += l_grad * batch_size
-                val_components[3] += l_tversky * batch_size
+                val_components[0] += l_mae.item() * batch_size
+                val_components[1] += l_ssim.item() * batch_size
+                val_components[2] += l_grad.item() * batch_size
+                val_components[3] += l_tversky.item() * batch_size
                 
                 # Leaderboard metrics
                 m_iou_b, m_iou_v, m_iou_w, m_rmse_b, m_rmse_v = calc_leaderboard_metrics(outputs, targets)
