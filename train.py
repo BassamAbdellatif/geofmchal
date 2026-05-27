@@ -389,8 +389,8 @@ def main():
     opt_params = list(model.parameters()) + list(criterion.parameters())
     optimizer = optim.AdamW(opt_params, lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
-    # Aggressive LR Scheduler
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
+    # LR Scheduler — patience=5 avoids premature LR collapse on noisy losses
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 
     print(f"Starting training on {DEVICE}...")
 
