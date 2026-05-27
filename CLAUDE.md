@@ -52,8 +52,8 @@ score = 0.25×IoU_B + 0.15×IoU_V + 0.15×IoU_W
 | `core/model.py` | YNetAttentionFusedDecoder with GradScale hook |
 | `core/dataset.py` | `Emb2HeightsDataset` with aligned augmentation (pixel+patch+target). augment_triplet() is synchronized. |
 | `predict.py` | Auto-reads training_params.txt. Use `--pixel-inputs`/`--patch-inputs` to override. |
-| `submit.py` | Packages predictions into zip for upload |
-| `uploader/upload.py` | Playwright-based direct upload to ESA platform using uploader/cookies.json |
+| `package.py` | Packages predictions into zip for upload |
+| `uploader/submit.py` | Playwright-based direct upload to ESA platform using uploader/cookies.json |
 | `config.py` | Auto-routes data paths per cluster node (n1/n2/n3/head) |
 
 ## Cluster Setup
@@ -74,10 +74,10 @@ cd /mnt/head/users/bassam/src/geofmchal
 ./run_env.sh predict.py --experiment-name <NAME>
 
 # 3. Package
-./run_env.sh submit.py --experiment-name <NAME>
+./run_env.sh package.py --experiment-name <NAME>
 
-# 4. Upload (needs uploader/cookies.json with valid ESA session)
-./run_env.sh uploader/upload.py --experiment-name <NAME>
+# 4. Submit (needs uploader/cookies.json with valid ESA session)
+./run_env.sh uploader/submit.py --experiment-name <NAME>
 ```
 
 ## Pending Improvements (priority order)
