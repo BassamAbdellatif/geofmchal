@@ -25,12 +25,12 @@ def upload_submission():
                 print(f"Loading session cookies from {COOKIES_FILE}...")
                 with open(COOKIES_FILE, "r") as f:
                     cookies = json.load(f)
-                # EditThisCookie exports lowercase / "unspecified" sameSite values.
-                # Playwright requires exactly "Strict", "Lax", or "None".
-                _samesite_map = {"strict": "Strict", "lax": "Lax", "none": "None"}
+                # Playwright requires sameSite to be exactly "Strict", "Lax", or "None".
+                # EditThisCookie exports lowercase ("lax") and "unspecified" — normalise in-memory.
+                _samesite_map = {"strict": "Strict", "lax": "Lax", "none": "None", "unspecified": "Lax"}
                 for cookie in cookies:
-                    ss = cookie.get("sameSite", "")
-                    cookie["sameSite"] = _samesite_map.get(str(ss).lower(), "None")
+                    raw = cookie.get("sameSite", "Lax")
+                    cookie["sameSite"] = _samesite_map.get(str(raw).lower(), "Lax")
                 context.add_cookies(cookies)
             else:
                 print(f"⚠️ Warning: USE_COOKIES is True but {COOKIES_FILE} is missing. Continuing without cookies.")
