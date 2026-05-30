@@ -115,7 +115,7 @@ def save_experiment_config(args_augment=False, args_dynamic_loss=False, pixel_in
         f.write(f"WEIGHT_DECAY: {WEIGHT_DECAY}\n")
         f.write(f"LOSS LAMBDAS: {LAMBDAS}\n")
         f.write(f"MODEL_TYPE: {MODEL_TYPE}\n")
-        if MODEL_TYPE in ("attention_fusion", "ynet_attention_fusion"):
+        if MODEL_TYPE in ("attention_fusion", "ynet_attention_fusion", "ynet_tessera_xattn", "ynet_tessera_broadcast"):
             f.write(f"PIXEL_INPUTS: {pixel_inputs}\n")
             f.write(f"PATCH_INPUTS: {patch_inputs}\n")
         else:
@@ -132,7 +132,7 @@ def save_experiment_config(args_augment=False, args_dynamic_loss=False, pixel_in
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train emb2heights baseline models")
-    parser.add_argument("--model-type", type=str, default=MODEL_TYPE, choices=["auto", "lightunet", "decoder_residual", "attention_fusion", "ynet_attention_fusion"])
+    parser.add_argument("--model-type", type=str, default=MODEL_TYPE, choices=["auto", "lightunet", "decoder_residual", "attention_fusion", "ynet_attention_fusion", "ynet_tessera_xattn", "ynet_tessera_broadcast"])
     parser.add_argument("--output-dir", type=str, default=BASE_DIR)
     parser.add_argument("--train-embeddings-dir", type=str, default=None, help="Path to training embeddings. Defaults to path in config.py based on model-type.")
     parser.add_argument("--train-targets-dir", type=str, default=None, help="Path to training targets. Defaults to path in config.py.")
@@ -143,9 +143,13 @@ def parse_args():
     parser.add_argument("--patch-size", type=int, default=PATCH_SIZE)
     parser.add_argument("--epochs", type=int, default=EPOCHS)
     parser.add_argument("--num-workers", type=int, default=8, help="Number of worker processes for DataLoader.")
-    parser.add_argument("--cache-in-memory", action="store_true", help="Cache dataset samples in CPU RAM on first load to speed up subsequent epochs.")
+    parser.add_argument(
+        "--cache-in-memory", nargs="?", const="all", default=None, type=str, metavar="SPEC",
+        help="Cache dataset in shared CPU memory. SPEC = 'all' (default if flag given), or comma-separated subset of {pixel,patch,target}. Per-sample float16: pixel~25MB, patch~0.8MB, target~0.5MB.",
+    )
     parser.add_argument("--augment", action="store_true", help="Enable synchronized spatial augmentation on the training set (flip + rot90).")
     parser.add_argument("--dynamic-loss", action="store_true", help="Enable curriculum height penalty ramp (1x -> 5x over training).")
+    parser.add_argument("--max-batches", type=int, default=0, help="If >0, stop each train/val epoch after this many batches. Smoke-test knob only.")
     return parser.parse_args()
 
 
@@ -252,7 +256,7 @@ def main():
     EPOCHS = args.epochs
 
     # Resolve directories using config.py
-    if MODEL_TYPE in ("attention_fusion", "ynet_attention_fusion"):
+    if MODEL_TYPE in ("attention_fusion", "ynet_attention_fusion", "ynet_tessera_xattn", "ynet_tessera_broadcast"):
         pixel_dirs = resolve_dirs(args.pixel_inputs, PIXEL_DIR_MAP)
         patch_dirs = resolve_dirs(args.patch_inputs, PATCH_DIR_MAP)
         targets_dir = args.train_targets_dir if args.train_targets_dir is not None else config.LABELS_DIR
@@ -285,14 +289,14 @@ def main():
     LOSS_CURVE_PATH = os.path.join(EXP_DIR, "loss_curve.png")
     CONFIG_LOG_PATH = os.path.join(EXP_DIR, "training_params.txt")
 
-    if MODEL_TYPE == "attention_fusion" or MODEL_TYPE == "ynet_attention_fusion":
+    if MODEL_TYPE in ("attention_fusion", "ynet_attention_fusion", "ynet_tessera_xattn", "ynet_tessera_broadcast"):
         save_experiment_config(args_augment=args.augment, args_dynamic_loss=args.dynamic_loss,
                                pixel_inputs=args.pixel_inputs, patch_inputs=args.patch_inputs)
     else:
         save_experiment_config(args_augment=args.augment, args_dynamic_loss=args.dynamic_loss)
 
     print("--- 1. Data Setup ---")
-    if MODEL_TYPE in ("attention_fusion", "ynet_attention_fusion"):
+    if MODEL_TYPE in ("attention_fusion", "ynet_attention_fusion", "ynet_tessera_xattn", "ynet_tessera_broadcast"):
         all_train_triplets = find_triple_file_pairs(pixel_dirs, patch_dirs, targets_dir)
         print(f"   >> Total matched triplets found: {len(all_train_triplets)}")
         if len(all_train_triplets) == 0:
@@ -394,7 +398,9 @@ def main():
         train_samples_seen = 0
 
         train_pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{EPOCHS} [train]", leave=True)
-        for batch in train_pbar:
+        for batch_idx, batch in enumerate(train_pbar):
+            if args.max_batches and batch_idx >= args.max_batches:
+                break
             optimizer.zero_grad()
             if isinstance(batch, dict):
                 pixel_emb = batch["pixel_emb"].to(DEVICE)
@@ -409,6 +415,10 @@ def main():
                 batch_size = imgs.size(0)
 
             loss, _, _, _, _ = criterion(outputs, targets, epoch, EPOCHS, use_dynamic_loss=args.dynamic_loss)
+            if not torch.isfinite(loss):
+                print(f"\n[WARN] NaN/inf loss at epoch {epoch+1} batch {batch_idx} — skipping update")
+                optimizer.zero_grad()
+                continue
             loss.backward()
 
             # NEW: Gradient Clipping
@@ -432,7 +442,9 @@ def main():
 
         with torch.no_grad():
             val_pbar = tqdm(val_loader, desc=f"Epoch {epoch + 1}/{EPOCHS} [val]", leave=True)
-            for batch in val_pbar:
+            for batch_idx, batch in enumerate(val_pbar):
+                if args.max_batches and batch_idx >= args.max_batches:
+                    break
                 if isinstance(batch, dict):
                     pixel_emb = batch["pixel_emb"].to(DEVICE)
                     patch_emb = batch["patch_emb"].to(DEVICE)
@@ -506,8 +518,9 @@ def main():
         epoch_times.append(epoch_elapsed)
         epoch_time_msg = f"   >> Epoch Time: {epoch_elapsed:.2f} seconds ({epoch_elapsed/60:.2f} minutes)\n"
         
-        # Curriculum boost value for logging
-        current_boost = 1.0 + 4.0 * (epoch / max(EPOCHS - 1, 1))
+        # HeightBoost value actually applied this epoch. Matches the gate inside
+        # ImprovedCompositeLoss: only ramps when --dynamic-loss is set; otherwise 1.0x.
+        current_boost = 1.0 + 4.0 * (epoch / max(EPOCHS - 1, 1)) if args.dynamic_loss else 1.0
 
         print(f"Epoch {epoch + 1}/{EPOCHS} | Train: {epoch_loss:.4f} | Val: {epoch_val_loss:.4f} | LR: {current_lr:.2e} | HeightBoost: {current_boost:.2f}x")
         print(epoch_time_msg, end="")

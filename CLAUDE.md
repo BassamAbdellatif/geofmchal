@@ -122,3 +122,15 @@ cd /mnt/head/users/bassam/src/geofmchal
 - **Augmentation**: ran before numpy worker_init_fn fix (crop diversity reduced but not fatal)
 - **GradScale α=0.1**: prevents height gradients from disrupting classification encoder
 - **2A beat 4A on platform**: because RMSE_B 3.12 vs 3.46m, and old proxy (C=30) didn't catch this
+
+## Experiment 6A — TESSERA Stream + Cross-Attention Fusion (`exp-6-tessera-xattn`)
+
+- **Branch**: `exp-6-tessera-xattn` (forked from `exp-4-ynet-gradhook`)
+- **Model class**: `YNetTesseraXAttn`  |  **dispatch name**: `ynet_tessera_xattn`
+- **Folder prefix**: `6A_*` (`6A_smoke_xattn`, `6A_mini_xattn`, `6A_tessera_xattn`)
+- **Inputs**: `--pixel-inputs alpha_earth,tessera --patch-inputs terramind_s1,terramind_s2`
+- **Hypothesis**: TESSERA (128ch, S1/S2 time-series) adds phenological signal AlphaEarth (64ch annual) lacks; cross-attention extracts more from patch tokens than spatial-broadcast fusion does.
+- **Architecture**: concat pixel stems (64+128=192ch → 64ch via 1×1) → shared U-Net encoder → MHA bottleneck (Q=pixel 16×16 @512d, K/V=patch 256 tokens @1536d→512d) → shared decoder → split heads (class 3ch, height 1ch with GradScale α=0.1).
+- **Spec**: see `prompts/exp-6-tessera-xattn.md` for the full implementation plan, smoke/mini/full test sequence, and acceptance criteria.
+
+> **Note on existing CLAUDE.md notes above:** the "Missing: veg_height_boost" annotation in the Key Files table is stale on this branch — `core/losses.py` does contain `veg_height_boost` (Section 0 pre-flight on 2026-05-28 confirmed it at line 208). Likewise the "best run: 4A_hook" line predates the `2A_vegboost` platform submission (0.3721) which is now the platform leader.

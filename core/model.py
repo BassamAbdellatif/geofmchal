@@ -628,6 +628,222 @@ class YNetAttentionFusedDecoder(nn.Module):
         return torch.cat([class_out, height_out], dim=1)
 
 
+# ==========================================
+# 6A: TESSERA Stream + Cross-Attention Fusion
+# (see prompts/exp-6-tessera-xattn.md)
+# ==========================================
+
+class CrossAttentionBlock(nn.Module):
+    """
+    One pre-LN transformer block where queries come from the pixel bottleneck
+    (16x16 = 256 tokens at dim D) and keys/values come from the patch tokens
+    (16x16 = 256 tokens at dim D_kv -> projected to D). Learned positional
+    encodings on both sides. Residual + FFN as in a standard transformer.
+    """
+
+    def __init__(self, dim=512, kv_dim=1536, num_heads=8, ffn_mult=2,
+                 num_q_tokens=256, num_kv_tokens=256, dropout=0.0):
+        super().__init__()
+        self.q_pos = nn.Parameter(torch.zeros(1, num_q_tokens, dim))
+        self.kv_pos = nn.Parameter(torch.zeros(1, num_kv_tokens, dim))
+        nn.init.trunc_normal_(self.q_pos, std=0.02)
+        nn.init.trunc_normal_(self.kv_pos, std=0.02)
+
+        self.kv_proj = nn.Linear(kv_dim, dim)
+
+        self.norm_q = nn.LayerNorm(dim)
+        self.norm_kv = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+
+        self.norm_ffn = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim * ffn_mult),
+            nn.GELU(),
+            nn.Linear(dim * ffn_mult, dim),
+        )
+
+    def forward(self, q_feat, kv_feat):
+        # q_feat: [B, D, Hq, Wq]   (pixel bottleneck)
+        # kv_feat: [B, Dkv, Hk, Wk] (patch tokens)
+        B, D, Hq, Wq = q_feat.shape
+        q_tokens = q_feat.flatten(2).transpose(1, 2)              # [B, Hq*Wq, D]
+        kv_tokens = kv_feat.flatten(2).transpose(1, 2)            # [B, Hk*Wk, Dkv]
+        kv_tokens = self.kv_proj(kv_tokens)                       # [B, Hk*Wk, D]
+
+        q_norm = self.norm_q(q_tokens + self.q_pos)
+        kv_norm = self.norm_kv(kv_tokens + self.kv_pos)
+        attn_out, _ = self.attn(q_norm, kv_norm, kv_norm, need_weights=False)
+        q_tokens = q_tokens + attn_out
+
+        q_tokens = q_tokens + self.ffn(self.norm_ffn(q_tokens))
+
+        return q_tokens.transpose(1, 2).reshape(B, D, Hq, Wq)
+
+
+class YNetTesseraXAttn(nn.Module):
+    """
+    Experiment 6A: AlphaEarth + TESSERA dual-stream pixel input,
+    cross-attention bottleneck fusion with patch tokens (terramind_s1+s2),
+    shared U-Net decoder body, split task heads with GradScale on the height
+    head's input. The dataset concatenates pixel streams along the channel
+    axis (in the order given by --pixel-inputs), and this model splits the
+    concatenation back into per-stream stems for instrumentation.
+    """
+
+    def __init__(
+        self,
+        alpha_channels=64,
+        tessera_channels=128,
+        patch_channels=1536,
+        n_classes=4,
+        num_heads=8,
+        height_grad_scale=0.1,
+        fusion_type="xattn",
+    ):
+        super().__init__()
+        assert n_classes == 4, "YNetTesseraXAttn outputs class(3) + height(1) = 4 channels."
+        assert fusion_type in ("xattn", "broadcast"), f"fusion_type must be 'xattn' or 'broadcast', got {fusion_type!r}"
+        self.alpha_channels = alpha_channels
+        self.tessera_channels = tessera_channels  # 0 = alpha-only ablation (n2)
+        self.patch_channels = patch_channels
+        self.height_grad_scale = height_grad_scale
+        self.fusion_type = fusion_type
+
+        if tessera_channels > 0:
+            # Dual-stream: each stem -> 32ch, concat to 64ch
+            self.alpha_stem = nn.Sequential(
+                nn.Conv2d(alpha_channels, 32, kernel_size=1, bias=False),
+                nn.BatchNorm2d(32),
+                nn.ReLU(inplace=True),
+            )
+            self.tessera_stem = nn.Sequential(
+                nn.Conv2d(tessera_channels, 32, kernel_size=1, bias=False),
+                nn.BatchNorm2d(32),
+                nn.ReLU(inplace=True),
+            )
+        else:
+            # Single-stream alpha-only ablation: stem -> 64ch directly
+            self.alpha_stem = nn.Sequential(
+                nn.Conv2d(alpha_channels, 64, kernel_size=1, bias=False),
+                nn.BatchNorm2d(64),
+                nn.ReLU(inplace=True),
+            )
+            self.tessera_stem = None
+
+        # Shared U-Net encoder (matches AttentionFusedDecoder / YNetAttentionFusedDecoder)
+        self.inc = DoubleConv(64, 64)
+        self.down1 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(64, 128))
+        self.down2 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(128, 256))
+        self.down3 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(256, 512))
+        self.down4_pool = nn.MaxPool2d(2)
+
+        # Bottleneck patch fusion: either cross-attention (default, n1/n2/n4)
+        # or broadcast/concat-conv (n3 ablation that isolates the xattn change).
+        if fusion_type == "xattn":
+            self.xattn = CrossAttentionBlock(
+                dim=512, kv_dim=patch_channels, num_heads=num_heads,
+                num_q_tokens=16 * 16, num_kv_tokens=16 * 16,
+            )
+            self.broadcast_fusion = None
+        else:  # "broadcast"
+            self.xattn = None
+            self.broadcast_fusion = nn.Sequential(
+                nn.Conv2d(512 + patch_channels, 512, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(512),
+                nn.ReLU(inplace=True),
+            )
+
+        # Shared decoder body (same attention-gated upsample stack as YNetDecoder)
+        self.up1 = StandardUpsampleBlock(512, 256)
+        self.att1 = AttentionGate(F_g=256, F_x=512, F_int=256)
+        self.dec_conv1 = ResidualConvBlock(768, 256)
+
+        self.up2 = StandardUpsampleBlock(256, 128)
+        self.att2 = AttentionGate(F_g=128, F_x=256, F_int=128)
+        self.dec_conv2 = ResidualConvBlock(384, 128)
+
+        self.up3 = StandardUpsampleBlock(128, 64)
+        self.att3 = AttentionGate(F_g=64, F_x=128, F_int=64)
+        self.dec_conv3 = ResidualConvBlock(192, 64)
+
+        self.up4 = StandardUpsampleBlock(64, 32)
+        self.att4 = AttentionGate(F_g=32, F_x=64, F_int=32)
+        self.dec_conv4 = ResidualConvBlock(96, 32)
+
+        # Split task heads: 2 conv layers each (3-channel class + 1-channel height)
+        self.class_head = nn.Sequential(
+            nn.Conv2d(32, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 3, kernel_size=1),
+        )
+        self.height_head = nn.Sequential(
+            nn.Conv2d(32, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 1, kernel_size=1),
+        )
+
+    def forward(self, pixel_emb, patch_emb):
+        # Dataset concatenates pixel streams in the order given by --pixel-inputs.
+        # Full model (n1): --pixel-inputs alpha_earth,tessera   -> 64+128 = 192 channels.
+        # Alpha-only (n2): --pixel-inputs alpha_earth           -> 64 channels.
+        if self.tessera_stem is not None:
+            assert pixel_emb.shape[1] == self.alpha_channels + self.tessera_channels, (
+                f"pixel_emb has {pixel_emb.shape[1]} channels, expected "
+                f"{self.alpha_channels} (alpha_earth) + {self.tessera_channels} (tessera). "
+                f"Run with --pixel-inputs alpha_earth,tessera in that order."
+            )
+            alpha = pixel_emb[:, :self.alpha_channels]
+            tessera = pixel_emb[:, self.alpha_channels:]
+            x = torch.cat([self.alpha_stem(alpha), self.tessera_stem(tessera)], dim=1)
+        else:
+            assert pixel_emb.shape[1] == self.alpha_channels, (
+                f"pixel_emb has {pixel_emb.shape[1]} channels, expected "
+                f"{self.alpha_channels} (alpha-only ablation). "
+                f"Run with --pixel-inputs alpha_earth alone."
+            )
+            x = self.alpha_stem(pixel_emb)            # [B, 64, 256, 256]
+
+        x1 = self.inc(x)                              # [B,  64, 256, 256]
+        x2 = self.down1(x1)                           # [B, 128, 128, 128]
+        x3 = self.down2(x2)                           # [B, 256,  64,  64]
+        x4 = self.down3(x3)                           # [B, 512,  32,  32]
+        bn = self.down4_pool(x4)                      # [B, 512,  16,  16]
+
+        if self.fusion_type == "xattn":
+            fused = self.xattn(bn, patch_emb)         # [B, 512, 16, 16]
+        else:  # broadcast
+            fused = self.broadcast_fusion(torch.cat([bn, patch_emb], dim=1))
+
+        d1 = self.up1(fused)
+        d1 = torch.cat([d1, self.att1(x4, d1)], dim=1)
+        d1 = self.dec_conv1(d1)
+
+        d2 = self.up2(d1)
+        d2 = torch.cat([d2, self.att2(x3, d2)], dim=1)
+        d2 = self.dec_conv2(d2)
+
+        d3 = self.up3(d2)
+        d3 = torch.cat([d3, self.att3(x2, d3)], dim=1)
+        d3 = self.dec_conv3(d3)
+
+        d4 = self.up4(d3)
+        d4 = torch.cat([d4, self.att4(x1, d4)], dim=1)
+        feat = self.dec_conv4(d4)                     # [B, 32, 256, 256]
+
+        # GradScale only on the input to the height head: encoder + shared decoder
+        # see the height task only at α (0.1) strength.
+        if self.training and self.height_grad_scale < 1.0:
+            feat_h = grad_scale(feat, self.height_grad_scale)
+        else:
+            feat_h = feat
+
+        class_out = self.class_head(feat)             # [B, 3, 256, 256]
+        height_out = self.height_head(feat_h)         # [B, 1, 256, 256]
+        return torch.cat([class_out, height_out], dim=1)
+
+
 def infer_model_type(n_channels):
     if n_channels == 768:
         return "decoder_residual"
@@ -647,7 +863,32 @@ def build_model(model_type, n_channels, n_classes, pixel_channels=128, patch_cha
         return AttentionFusedDecoder(pixel_channels=pixel_channels, patch_channels=patch_channels, out_channels=n_classes), selected
     if selected == "ynet_attention_fusion":
         return YNetAttentionFusedDecoder(pixel_channels=pixel_channels, patch_channels=patch_channels), selected
+    if selected in ("ynet_tessera_xattn", "ynet_tessera_broadcast"):
+        # pixel_channels is the total concat channel count from the dataset.
+        #   192 = 64 (alpha_earth) + 128 (tessera)  ->  full model (n1, n3, n4)
+        #    64 = alpha_earth alone                 ->  alpha-only ablation (n2)
+        #   128 = tessera alone                     ->  tessera-only (kept for completeness)
+        if pixel_channels == 64 + 128:
+            alpha_ch, tessera_ch = 64, 128
+        elif pixel_channels == 64:
+            alpha_ch, tessera_ch = 64, 0
+        elif pixel_channels == 128:
+            alpha_ch, tessera_ch = 128, 0
+        else:
+            raise ValueError(
+                f"{selected} expects pixel_channels in {{64, 128, 192}} "
+                f"(alpha-only / tessera-only / both). Got {pixel_channels}. "
+                f"Use --pixel-inputs alpha_earth[,tessera]."
+            )
+        fusion = "broadcast" if selected == "ynet_tessera_broadcast" else "xattn"
+        return YNetTesseraXAttn(
+            alpha_channels=alpha_ch,
+            tessera_channels=tessera_ch,
+            patch_channels=patch_channels,
+            n_classes=n_classes,
+            fusion_type=fusion,
+        ), selected
 
     raise ValueError(
-        f"Unknown model_type '{model_type}'. Use one of: auto, lightunet, decoder_residual, attention_fusion, ynet_attention_fusion"
+        f"Unknown model_type '{model_type}'. Use one of: auto, lightunet, decoder_residual, attention_fusion, ynet_attention_fusion, ynet_tessera_xattn, ynet_tessera_broadcast"
     )

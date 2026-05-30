@@ -290,7 +290,7 @@ def main():
     predictions_dir = os.path.join(exp_dir, "predictions_tta" if use_tta else "predictions")
     os.makedirs(predictions_dir, exist_ok=True)
 
-    if model_type in ("attention_fusion", "ynet_attention_fusion"):
+    if model_type in ("attention_fusion", "ynet_attention_fusion", "ynet_tessera_xattn", "ynet_tessera_broadcast"):
         pixel_dir_map = PIXEL_TEST_DIR_MAP
         patch_dir_map = PATCH_TEST_DIR_MAP
 
