@@ -421,7 +421,6 @@ Reserved for follow-up prompt. Priority order:
 - Do not submit to platform without approval
 - Do not modify `results.md` or `science.md`; only append to `CLAUDE.md` for new branch/model
 - Do not include THOR in baseline (Phase 5 ablation)
-If a manual edit is made to the codebase outside the agent's session (e.g. via VS Code), the agent should git pull or git status before resuming a phase to detect changes, rather than assuming its working tree is authoritative.
 
 ## If you get stuck
 - Embedding missing → STOP, report
