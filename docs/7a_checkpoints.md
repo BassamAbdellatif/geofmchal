@@ -125,13 +125,68 @@ dispatch).
 
 ---
 
+## Checkpoint 3 — Phase 3: Loss + GradNorm + Training/Inference ✅ (awaiting review)
+
+### `DualPathLoss` + `GradNormBalancer` (core/losses.py, additive)
+- **Fractions:** MAE (calibration) + soft-Dice at `sigmoid(5·(logit−0.5))` vs
+  `(target>0.5)` — continuous relaxation of hard IoU at the 0.5 cut. No SSIM/GDL.
+- **Height:** Huber (δ=0.5) on mask `(B>0)|(V>0)` + 0.1× on the complement.
+- **Binary:** BCE + soft-Dice on `(building_frac>0.5)`.
+- **GradNorm** (α=1.5, separate AdamW lr=0.025): per-task grad-norm measured
+  (detached) through a reference encoder param; `step()` is called *before* the
+  model `backward()` (retain_graph, no second-order graph); weights renormalised
+  to sum=n. Standalone test: losses finite, both encoders receive gradient,
+  weights evolve (height down-weighted as it converges fastest), sum stays 3.0.
+
+### `train.py` — `train_7a()` + `evaluate_7a()`
+Self-contained dispatch (`if MODEL_TYPE=="dual_enc_dec_fusion": return train_7a`).
+Geo-CV split, stratified sampler, GradNorm (flag-toggled), Cosine LR, grad-clip
+1.0, best-checkpoint by proxy, writes `training_params.txt` + `loss_curve.png`.
+`evaluate_7a`: hard-IoU@0.5, masked RMSE (m), proxy (C=4.0), per-task losses.
+
+### `predict.py` — `predict_7a()` + helpers
+Dict output; `--tta` (D4 8-fold, pre-sigmoid logit averaging incl. patch grid
+rot/flip); `--blend-binary` (`B = max(fracB, binaryB)` where binary>0.5);
+`--threshold-config` (piecewise-linear remap so a calibrated threshold → 0.5).
+Added `_resolve_runs_dir()` so predict reads the same head-node runs dir train uses.
+
+### Runtime verification (real, reproduced)
+| Run | Result |
+|-----|--------|
+| **smoke** (b4, 1 ep, 2 batches) | completes exit 0; pipeline OK end-to-end |
+| **mini** (b32, 3 ep, geo-CV fold 0) | proxy **0.209 → 0.247 → 0.272**, monotonic; ≫ spec bar 0.18 |
+| predict plain | 946 test tiles, (4,256,256), frac [0.002, 0.996], height [0, 18.3 m], finite |
+| predict TTA+blend+thresholds | path verified (valid finite output); full 946 run ≈110 min is a Phase-4 step |
+
+Mini per-epoch (reproduced run):
+| Ep | proxy | IoU B/V/W | RMSE B/V (m) | GradNorm w[f/h/b] |
+|----|-------|-----------|--------------|-------------------|
+| 1 | 0.209 | 0.069/0.661/0.301 | 5.91/5.72 | 1.07/0.79/1.14 |
+| 2 | 0.247 | 0.102/0.701/0.346 | 4.93/5.18 | 1.16/0.62/1.22 |
+| 3 | 0.272 | 0.127/0.726/0.379 | 4.41/4.79 | 1.31/0.49/1.20 |
+
+RMSE is still above the 3.9 m scoring floor at epoch 3 — expected, height
+converges slowly and only 3 epochs ran. The 60-epoch baseline (Phase 4) is where
+height has time to matter. GradNorm steadily up-weights fractions (1.07→1.31) and
+down-weights height (0.79→0.49) as height's loss falls fastest.
+
+### ⚠️ GPU memory — real finding (corrects the Phase-2 estimate)
+Batch 32 needs **~40 GB**. The first mini attempt **OOM'd** because a 6.48 GB
+co-resident process was sharing the 47.4 GB card. On a free GPU the rerun used
+40.1 GB and trained fine (run with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`).
+So batch 32 fits a 48 GB GPU **only with the card to itself**. Phase 4 must use an
+exclusive GPU, or apply the spec OOM fallback (drop the 32×32 patch injection,
+then reduce batch).
+
+### Files
+Modified (additive / new branches; legacy paths untouched):
+`core/losses.py`, `train.py`, `predict.py`.
+
+---
+
 ## Pending
 
-- **Phase 3** — `DualPathLoss` (MAE + soft-Dice k=5 fractions; Huber δ=0.5 masked
-  + 0.1 tail height; BCE + soft-Dice binary), GradNorm (α=1.5), train.py 7A
-  training branch (proxy C=4.0, best-ckpt by proxy on geo-CV val), predict.py
-  dict-output + D4 TTA + `--blend-binary` + `--threshold-config`. Smoke + mini
-  runs.
-- **Phase 4** — 60-epoch baseline, threshold scan, TTA predict.
-- **Phase 5** — ablations (incl. revisit coverage metric; THOR; stem
-  downsample-to-32 vs full-res).
+- **Phase 4** — 60-epoch baseline (`7A_geocv_baseline`) on an exclusive GPU,
+  `threshold_scan.py`, TTA+blend+threshold predict, compare vs 2A_vegboost.
+- **Phase 5** — ablations (revisit coverage metric; THOR; stem downsample-to-32
+  vs full-res; the 6 structural claims).
