@@ -9,8 +9,12 @@ import torch
 from tqdm import tqdm
 
 # --- IMPORT FROM CORE MODULES ---
+import json
 from core.model import build_model
-from core.dataset import _normalize_core_id, HEIGHT_NORM_CONSTANT
+from core.dataset import (
+    _normalize_core_id, HEIGHT_NORM_CONSTANT,
+    find_multimodal_test_tiles, _sanitize, _pad_to, _apply_norm, _load_norm_stats,
+)
 
 # --- DEFAULTS ---
 EXPERIMENT_NAME = "terramind_decoder_run01"
@@ -80,6 +84,12 @@ def parse_args():
     parser.add_argument("--tta", action="store_true",
                         help="Enable 8-fold Test-Time Augmentation (4 rotations × 2 flips). "
                              "Averages predictions in logit space before sigmoid. No retraining needed.")
+    parser.add_argument("--blend-binary", action="store_true",
+                        help="[7A] Blend the aux binary-building head into channel 0: "
+                             "B = max(fraction_B, binary_B) where the binary head is confident.")
+    parser.add_argument("--threshold-config", type=str, default=None,
+                        help="[7A] JSON of per-channel thresholds {\"B\":..,\"V\":..,\"W\":..} for "
+                             "hard-IoU calibration. Relative paths resolve in the experiment dir.")
     return parser.parse_args()
 
 
@@ -262,15 +272,28 @@ def load_experiment_params(exp_dir):
     return params
 
 
+def _resolve_runs_dir():
+    """Resolve runs dir (config.SHARED_RUNS_DIR may point at a nonexistent path)."""
+    head = "/mnt/head/users/bassam/data/geofmdata/runs"
+    if os.path.isdir(head):
+        return head
+    return config.SHARED_RUNS_DIR
+
+
 def main():
     args = parse_args()
-    exp_dir = os.path.join(config.SHARED_RUNS_DIR, args.experiment_name)
+    exp_dir = os.path.join(_resolve_runs_dir(), args.experiment_name)
     params = load_experiment_params(exp_dir)
 
     if not params:
         raise RuntimeError(f"Could not find or load training_params.txt in {exp_dir}")
 
     model_type = params.get("MODEL_TYPE", "decoder_residual").lower()
+
+    # 7A dispatch: fully self-contained inference path.
+    if model_type == "dual_enc_dec_fusion":
+        return predict_7a(args, exp_dir, params)
+
     # CLI args take priority; fall back to training_params.txt; empty string triggers fallback parser below
     pixel_inputs = args.pixel_inputs or params.get("PIXEL_INPUTS", "")
     patch_inputs = args.patch_inputs or params.get("PATCH_INPUTS", "")
@@ -414,6 +437,146 @@ def main():
 
     print(f"Predictions saved to: {predictions_dir}")
     print(f"Output shape per file: {pred_np.shape} [building%, veg%, water%, height_m]")
+
+
+# =============================================================================
+# 7A — Inference for DualEncDualDecFusion
+# =============================================================================
+
+DATA_ROOT_7A = "/mnt/head/users/bassam/data/geofmdata/embed2heights/data"
+_NORM_STATS_7A = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "data", "norm_stats.json")
+
+
+def _load_test_tile_7a(tile, norm_stats):
+    """Preprocess one test tile exactly like the dataset val path (no aug)."""
+    def _read(p):
+        with rasterio.open(p) as src:
+            return src.read().astype(np.float32)
+
+    alpha = _pad_to(_sanitize(_read(tile["alpha_path"])))
+    tessera = _pad_to(_sanitize(_read(tile["tessera_path"])))
+    tm_s1 = _sanitize(_read(tile["tm_s1_path"])).reshape(768, -1).T
+    tm_s2 = _sanitize(_read(tile["tm_s2_path"])).reshape(768, -1).T
+
+    if norm_stats:
+        alpha = _apply_norm(alpha, norm_stats["alpha_earth"]["mean"], norm_stats["alpha_earth"]["std"])
+        tessera = _apply_norm(tessera, norm_stats["tessera"]["mean"], norm_stats["tessera"]["std"])
+        tm_s1 = _apply_norm(tm_s1, norm_stats["terramind_s1"]["mean"], norm_stats["terramind_s1"]["std"], channel_axis=-1)
+        tm_s2 = _apply_norm(tm_s2, norm_stats["terramind_s2"]["mean"], norm_stats["terramind_s2"]["std"], channel_axis=-1)
+
+    return {
+        "alpha_earth": torch.from_numpy(alpha).unsqueeze(0),
+        "tessera": torch.from_numpy(tessera).unsqueeze(0),
+        "terramind_s1": torch.from_numpy(tm_s1).unsqueeze(0),
+        "terramind_s2": torch.from_numpy(tm_s2).unsqueeze(0),
+    }
+
+
+def _raw_logits_7a(model, batch):
+    """Forward -> 5-channel raw map [fracB,fracV,fracW, binary, height] (pre-sigmoid)."""
+    out = model(batch)
+    return torch.cat([out["fraction"], out["binary"], out["height"]], dim=1)
+
+
+def _tta_logits_7a(model, batch):
+    """D4 8-fold TTA averaging the 5-channel raw logits in logit space."""
+    acc = None
+    for k in range(4):
+        for flip in (False, True):
+            b = {}
+            for key in ("alpha_earth", "tessera"):
+                x = torch.rot90(batch[key], k, dims=[-2, -1])
+                if flip:
+                    x = torch.flip(x, dims=[-1])
+                b[key] = x
+            for key in ("terramind_s1", "terramind_s2"):
+                grid = batch[key].reshape(1, 16, 16, -1)
+                grid = torch.rot90(grid, k, dims=[1, 2])
+                if flip:
+                    grid = torch.flip(grid, dims=[2])
+                b[key] = grid.reshape(1, 256, -1)
+            logits = _raw_logits_7a(model, b)
+            if flip:
+                logits = torch.flip(logits, dims=[-1])
+            if k > 0:
+                logits = torch.rot90(logits, -k, dims=[-2, -1])
+            acc = logits if acc is None else acc + logits
+    return acc / 8.0
+
+
+def _apply_threshold_remap(prob, t):
+    """Piecewise-linear remap so a calibrated threshold t maps to the platform's 0.5 cut."""
+    if t is None or abs(t - 0.5) < 1e-6:
+        return prob
+    out = np.where(prob <= t, 0.5 * prob / max(t, 1e-6),
+                   0.5 + 0.5 * (prob - t) / max(1.0 - t, 1e-6))
+    return out.astype(np.float32)
+
+
+def predict_7a(args, exp_dir, params):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    use_tta = args.tta
+    blend = args.blend_binary
+
+    thresholds = None
+    if args.threshold_config:
+        tcfg = args.threshold_config
+        if not os.path.isabs(tcfg):
+            tcfg = os.path.join(exp_dir, tcfg)
+        with open(tcfg) as f:
+            thresholds = json.load(f)
+        print(f"  Loaded thresholds: {thresholds}")
+
+    norm_stats = _load_norm_stats(_NORM_STATS_7A)
+    if norm_stats is None:
+        print("  WARNING: norm_stats.json not found; predicting on un-normalised inputs.")
+
+    predictions_dir = os.path.join(exp_dir, "predictions_tta" if use_tta else "predictions")
+    os.makedirs(predictions_dir, exist_ok=True)
+
+    model_path = os.path.join(exp_dir, "model_best.pth")
+    if not os.path.exists(model_path):
+        model_path = os.path.join(exp_dir, "model_last.pth")
+
+    model, _ = build_model("dual_enc_dec_fusion", n_channels=64, n_classes=4)
+    model = model.to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+    print(f"  Loaded {model_path} | TTA={'on' if use_tta else 'off'} blend_binary={blend}")
+
+    tiles = find_multimodal_test_tiles(DATA_ROOT_7A, use_thor=False)
+    print(f"  Found {len(tiles)} test tiles.")
+
+    pred_np = None
+    desc = "Predicting 7A (TTA 8x)" if use_tta else "Predicting 7A"
+    with torch.no_grad():
+        for tile in tqdm(tiles, desc=desc):
+            batch = {k: v.to(device) for k, v in _load_test_tile_7a(tile, norm_stats).items()}
+            logits = _tta_logits_7a(model, batch) if use_tta else _raw_logits_7a(model, batch)
+            logits = logits.squeeze(0)                       # (5,H,W)
+
+            frac = torch.sigmoid(logits[:3]).cpu().numpy()
+            binary = torch.sigmoid(logits[3]).cpu().numpy()
+            height = (logits[4] * HEIGHT_NORM_CONSTANT).cpu().numpy()
+
+            if blend:
+                m = binary > 0.5
+                frac[0][m] = np.maximum(frac[0][m], binary[m])
+
+            if thresholds:
+                key = {0: "B", 1: "V", 2: "W"}
+                for c in range(3):
+                    t = thresholds.get(key[c])
+                    if t is not None:
+                        frac[c] = _apply_threshold_remap(frac[c], float(t))
+
+            pred_np = np.concatenate([frac, height[None]], axis=0).astype(np.float32)
+            np.save(os.path.join(predictions_dir, f"{tile['core_id']}.npy"), pred_np)
+
+    print(f"  Predictions saved to: {predictions_dir}")
+    if pred_np is not None:
+        print(f"  Output shape per file: {pred_np.shape} [B%, V%, W%, height_m]")
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 import torch
 import torch.optim as optim
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from sklearn.model_selection import train_test_split
 from tqdm.auto import tqdm
 
@@ -22,7 +22,7 @@ from core.dataset import (
     GeoFMDataset7A,
     HEIGHT_NORM_CONSTANT
 )
-from core.losses import ImprovedCompositeLoss
+from core.losses import ImprovedCompositeLoss, DualPathLoss, GradNormBalancer
 
 # --- 1. EXPERIMENT TRACKING ---
 EXPERIMENT_NAME = "terramid_run02/"
@@ -221,6 +221,10 @@ def main():
     BATCH_SIZE = args.batch_size
     PATCH_SIZE = args.patch_size
     EPOCHS = args.epochs
+
+    # 7A dispatch: fully self-contained path; never touches the legacy branches.
+    if MODEL_TYPE == "dual_enc_dec_fusion":
+        return train_7a(args)
 
     # Resolve directories using config.py
     if MODEL_TYPE == "attention_fusion":
@@ -473,6 +477,222 @@ def main():
     plt.legend()
     plt.savefig(LOSS_CURVE_PATH)
     plt.close()
+
+# =============================================================================
+# 7A — Training path for DualEncDualDecFusion
+# =============================================================================
+
+DATA_ROOT_7A = "/mnt/head/users/bassam/data/geofmdata/embed2heights/data"
+
+
+def _runs_dir_7a():
+    """Resolve runs output dir (config.py may point at a path that doesn't exist)."""
+    head = "/mnt/head/users/bassam/data/geofmdata/runs"
+    if os.path.isdir(os.path.dirname(head)):
+        os.makedirs(head, exist_ok=True)
+        return head
+    os.makedirs(config.SHARED_RUNS_DIR, exist_ok=True)
+    return config.SHARED_RUNS_DIR
+
+
+@torch.no_grad()
+def evaluate_7a(model, val_loader, criterion, device, C=4.0):
+    """Hard-IoU@0.5 (B/V/W), masked RMSE in metres (B/V), proxy (C=4.0), val losses."""
+    model.eval()
+    inter = torch.zeros(3, device=device)
+    union = torch.zeros(3, device=device)
+    se_b = torch.zeros((), device=device); n_b = torch.zeros((), device=device)
+    se_v = torch.zeros((), device=device); n_v = torch.zeros((), device=device)
+    task_sums = {"fraction": 0.0, "height": 0.0, "binary": 0.0}
+    nb = 0
+
+    for batch in val_loader:
+        batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+        target = batch["target"]
+        out = model(batch)
+        losses = criterion(out, target)
+        for k in task_sums:
+            task_sums[k] += float(losses[k].detach())
+        nb += 1
+
+        pred = torch.cat([torch.sigmoid(out["fraction"]), out["height"]], dim=1)
+        for c in range(3):
+            p = pred[:, c] > 0.5
+            t = target[:, c] > 0.5
+            inter[c] += (p & t).sum()
+            union[c] += (p | t).sum()
+
+        pred_h = pred[:, 3] * HEIGHT_NORM_CONSTANT
+        tgt_h = target[:, 3] * HEIGHT_NORM_CONSTANT
+        sq = (pred_h - tgt_h) ** 2
+        mb = target[:, 0] > 0
+        mv = target[:, 1] > 0
+        se_b += (sq * mb).sum(); n_b += mb.sum()
+        se_v += (sq * mv).sum(); n_v += mv.sum()
+
+    iou_b, iou_v, iou_w = (inter / union.clamp_min(1.0)).cpu().tolist()
+    rmse_b = float(torch.sqrt(se_b / n_b.clamp_min(1.0)))
+    rmse_v = float(torch.sqrt(se_v / n_v.clamp_min(1.0)))
+    proxy = (0.25 * iou_b + 0.15 * iou_v + 0.15 * iou_w
+             + 0.25 * max(0.0, 1.0 - rmse_b / C)
+             + 0.20 * max(0.0, 1.0 - rmse_v / C))
+    return {
+        "iou_b": iou_b, "iou_v": iou_v, "iou_w": iou_w,
+        "rmse_b": rmse_b, "rmse_v": rmse_v, "proxy": proxy,
+        "val_task_losses": {k: v / max(1, nb) for k, v in task_sums.items()},
+    }
+
+
+def train_7a(args):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    runs_dir = _runs_dir_7a()
+    exp_dir = os.path.join(runs_dir, args.experiment_name)
+    os.makedirs(exp_dir, exist_ok=True)
+    best_path = os.path.join(exp_dir, "model_best.pth")
+    last_path = os.path.join(exp_dir, "model_last.pth")
+    cfg_path = os.path.join(exp_dir, "training_params.txt")
+    curve_path = os.path.join(exp_dir, "loss_curve.png")
+
+    with open(cfg_path, "w") as f:
+        f.write(f"--- EXPERIMENT: {args.experiment_name} ---\n")
+        f.write("MODEL_TYPE: dual_enc_dec_fusion\n")
+        f.write(f"PATCH_SIZE: {args.patch_size}\n")
+        f.write(f"BATCH_SIZE: {args.batch_size}\n")
+        f.write(f"EPOCHS: {args.epochs}\n")
+        f.write(f"CV_FOLD: {args.cv_fold}\n")
+        f.write(f"USE_STRATIFIED_SAMPLER: {args.use_stratified_sampler}\n")
+        f.write(f"USE_GRADNORM: {args.use_gradnorm}\n")
+        f.write(f"USE_THOR: {args.use_thor}\n")
+        f.write(f"OPTIMIZER: AdamW lr={LEARNING_RATE} wd={WEIGHT_DECAY}\n")
+
+    print("--- 7A Data Setup ---")
+    tiles = find_multimodal_train_tiles(DATA_ROOT_7A)
+    train_ds = GeoFMDataset7A(tiles, is_train=True, cv_fold=args.cv_fold)
+    val_ds = GeoFMDataset7A(tiles, is_train=False, cv_fold=args.cv_fold)
+    print(f"   >> matched={len(tiles)}  train={len(train_ds)}  val={len(val_ds)}  (cv_fold={args.cv_fold})")
+
+    if args.use_stratified_sampler:
+        weights = train_ds.sampler_weights()
+        sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+        shuffle = False
+    else:
+        sampler = None
+        shuffle = True
+
+    train_loader = DataLoader(
+        train_ds, batch_size=args.batch_size, sampler=sampler, shuffle=shuffle,
+        num_workers=args.num_workers, pin_memory=True, drop_last=True,
+        worker_init_fn=worker_init_fn,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=True,
+    )
+
+    print("--- 7A Model Init ---")
+    model, _ = build_model("dual_enc_dec_fusion", n_channels=64, n_classes=4)
+    model = model.to(device)
+    print(f"   >> params: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
+
+    criterion = DualPathLoss().to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+
+    task_names = ["fraction", "height", "binary"]
+    use_gn = args.use_gradnorm
+    if use_gn:
+        balancer = GradNormBalancer(task_names, device, alpha=1.5, lr=0.025)
+        ref_params = {
+            "fraction": model.alpha_encoder.down4.block[0].weight,
+            "binary":   model.alpha_encoder.down4.block[0].weight,
+            "height":   model.tessera_encoder.down4.block[0].weight,
+        }
+    else:
+        balancer = None
+        static_w = {"fraction": 1.0, "height": 1.0, "binary": 1.0}
+
+    best_proxy = -1.0
+    train_hist, proxy_hist = [], []
+    total_start = time.time()
+
+    for epoch in range(args.epochs):
+        model.train()
+        running = 0.0; seen = 0
+        ep_task = {k: 0.0 for k in task_names}
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [train]", leave=True)
+        for bi, batch in enumerate(pbar):
+            if args.max_batches and bi >= args.max_batches:
+                break
+            batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+            target = batch["target"]
+            optimizer.zero_grad()
+            out = model(batch)
+            per_task = criterion(out, target)
+
+            if use_gn:
+                balancer.step(per_task, ref_params)        # before model backward
+                w = balancer.weights()
+                loss = sum(w[i] * per_task[n] for i, n in enumerate(task_names))
+            else:
+                loss = sum(static_w[n] * per_task[n] for n in task_names)
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            bs = target.size(0)
+            running += float(loss.detach()) * bs; seen += bs
+            for n in task_names:
+                ep_task[n] += float(per_task[n].detach()) * bs
+            pbar.set_postfix(loss=f"{float(loss.detach()):.4f}")
+
+        scheduler.step()
+        epoch_loss = running / max(1, seen)
+        train_hist.append(epoch_loss)
+        ep_task = {k: v / max(1, seen) for k, v in ep_task.items()}
+
+        metrics = evaluate_7a(model, val_loader, criterion, device)
+        proxy_hist.append(metrics["proxy"])
+
+        if metrics["proxy"] > best_proxy:
+            best_proxy = metrics["proxy"]
+            torch.save(model.state_dict(), best_path)
+            tag = "  *** new best ***"
+        else:
+            tag = ""
+
+        gn_str = ""
+        if use_gn:
+            wd = balancer.weight_dict()
+            gn_str = "  w[f/h/b]=%.2f/%.2f/%.2f" % (wd["fraction"], wd["height"], wd["binary"])
+        print(f"Epoch {epoch+1}/{args.epochs} | train {epoch_loss:.4f} | "
+              f"proxy {metrics['proxy']:.4f} | IoU B/V/W {metrics['iou_b']:.3f}/"
+              f"{metrics['iou_v']:.3f}/{metrics['iou_w']:.3f} | RMSE B/V "
+              f"{metrics['rmse_b']:.2f}/{metrics['rmse_v']:.2f}m{gn_str}{tag}")
+        with open(cfg_path, "a") as f:
+            f.write(f"Epoch {epoch+1}: train={epoch_loss:.4f} proxy={metrics['proxy']:.4f} "
+                    f"IoU_B={metrics['iou_b']:.4f} IoU_V={metrics['iou_v']:.4f} "
+                    f"IoU_W={metrics['iou_w']:.4f} RMSE_B={metrics['rmse_b']:.3f} "
+                    f"RMSE_V={metrics['rmse_v']:.3f} task_train={ep_task} "
+                    f"val_task={metrics['val_task_losses']}{gn_str}\n")
+
+    torch.save(model.state_dict(), last_path)
+    total_min = (time.time() - total_start) / 60
+    print(f"\n=== 7A DONE === best proxy={best_proxy:.4f}  total={total_min:.1f}m")
+    with open(cfg_path, "a") as f:
+        f.write(f"BEST_PROXY: {best_proxy:.4f}\nTOTAL_MIN: {total_min:.1f}\n")
+
+    try:
+        plt.figure()
+        plt.plot(train_hist, label="train loss")
+        plt.plot(proxy_hist, label="val proxy")
+        plt.legend(); plt.title(f"7A {args.experiment_name}")
+        plt.savefig(curve_path); plt.close()
+    except Exception as e:
+        print(f"   (curve plot skipped: {e})")
+
+    return best_proxy
+
 
 if __name__ == "__main__":
     main()
