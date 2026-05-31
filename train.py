@@ -17,9 +17,9 @@ from core.model import build_model
 from core.dataset import (
     PixelEmbeddingDataset,
     LatentTokenDataset,
-    Emb2HeightsDataset,
     find_file_pairs,
-    find_triple_file_pairs,
+    find_multimodal_train_tiles,
+    GeoFMDataset7A,
     HEIGHT_NORM_CONSTANT
 )
 from core.losses import ImprovedCompositeLoss
@@ -122,7 +122,7 @@ def save_experiment_config(pixel_inputs=None, patch_inputs=None):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train emb2heights baseline models")
-    parser.add_argument("--model-type", type=str, default=MODEL_TYPE, choices=["auto", "lightunet", "decoder_residual", "attention_fusion"])
+    parser.add_argument("--model-type", type=str, default=MODEL_TYPE, choices=["auto", "lightunet", "decoder_residual", "attention_fusion", "dual_enc_dec_fusion"])
     parser.add_argument("--output-dir", type=str, default=BASE_DIR)
     parser.add_argument("--train-embeddings-dir", type=str, default=None, help="Path to training embeddings. Defaults to path in config.py based on model-type.")
     parser.add_argument("--train-targets-dir", type=str, default=None, help="Path to training targets. Defaults to path in config.py.")
@@ -134,7 +134,21 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=EPOCHS)
     parser.add_argument("--num-workers", type=int, default=8, help="Number of worker processes for DataLoader.")
     parser.add_argument("--cache-in-memory", action="store_true", help="Cache dataset samples in CPU RAM on first load to speed up subsequent epochs.")
+    # --- 7A (dual_enc_dec_fusion) options ---
+    parser.add_argument("--cv-fold", type=int, default=0, help="[7A] Geographic CV fold to hold out for validation (0-4). See data/geo_folds.json.")
+    parser.add_argument("--use-stratified-sampler", action=argparse.BooleanOptionalAction, default=True, help="[7A] Use WeightedRandomSampler over coverage strata (default True).")
+    parser.add_argument("--use-gradnorm", action=argparse.BooleanOptionalAction, default=True, help="[7A] Learn task loss weights with GradNorm (default True). Used in Phase 3.")
+    parser.add_argument("--use-thor", action=argparse.BooleanOptionalAction, default=False, help="[7A] Include THOR embeddings (default False; Phase 5 ablation).")
+    parser.add_argument("--max-batches", type=int, default=0, help="If >0, cap batches per epoch (smoke testing).")
     return parser.parse_args()
+
+
+def worker_init_fn(worker_id):
+    """Seed numpy/torch per worker so augmentation RNG differs across workers and epochs."""
+    base_seed = torch.initial_seed() % (2**31 - 1)
+    seed = (base_seed + worker_id) % (2**31 - 1)
+    np.random.seed(seed)
+    random.seed(seed)
 
 
 def align_target_to_output(target, output):
