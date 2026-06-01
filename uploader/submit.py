@@ -24,9 +24,17 @@ def parse_args():
     return parser.parse_args()
 
 
+def _resolve_runs_dir():
+    """Resolve runs dir (config.SHARED_RUNS_DIR may point at a nonexistent path)."""
+    head = "/mnt/head/users/bassam/data/geofmdata/runs"
+    if os.path.isdir(head):
+        return head
+    return config.SHARED_RUNS_DIR
+
+
 def upload_submission():
     args = parse_args()
-    exp_dir = os.path.join(config.SHARED_RUNS_DIR, args.experiment_name)
+    exp_dir = os.path.join(_resolve_runs_dir(), args.experiment_name)
 
     if args.zip_file:
         FILE_PATH = args.zip_file

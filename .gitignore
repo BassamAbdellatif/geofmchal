@@ -3,3 +3,8 @@ run.txt
 __pycache__/
 *.orig
 runs
+
+# Upload secrets and artifacts (never commit)
+uploader/cookies.json
+*.png
+nohup.out
