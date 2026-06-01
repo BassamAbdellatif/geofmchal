@@ -184,9 +184,119 @@ Modified (additive / new branches; legacy paths untouched):
 
 ---
 
-## Pending
+## Checkpoint 4 — Phase 4: Baseline + Inference + first platform submission
 
-- **Phase 4** — 60-epoch baseline (`7A_geocv_baseline`) on an exclusive GPU,
-  `threshold_scan.py`, TTA+blend+threshold predict, compare vs 2A_vegboost.
-- **Phase 5** — ablations (revisit coverage metric; THOR; stem downsample-to-32
-  vs full-res; the 6 structural claims).
+### Training (`7A_geocv_baseline`, 60 epochs, geo-CV fold 0, batch 32)
+- **Best proxy 0.3946 at epoch 29** (`model_best.pth`); plateaued ~0.39 from
+  ~epoch 25 onward, epoch 60 proxy 0.3912 — stable, not a spike.
+- Best-epoch internal val: IoU_B 0.200, IoU_V 0.812, IoU_W 0.687, RMSE_B 2.09 m,
+  RMSE_V 4.00 m. Total train time 8.7 h on one 48 GB GPU (~40 GB used).
+- GradNorm behaved as designed: height weight high early (drives RMSE down), then
+  capacity shifted to the binary head late (w_b 0.91→1.45) to fight buildings.
+
+### Threshold calibration (`threshold_scan.py`, geo-CV val)
+| Channel | best t | IoU gain vs 0.5 |
+|---------|--------|-----------------|
+| B | 0.20 | +0.037 (0.200 → 0.237) |
+| V | 0.60 | +0.000 |
+| W | 0.55 | +0.000 |
+
+Buildings are systematically under-predicted (sigmoid mass below 0.5), so a 0.20
+cut recovers real IoU_B. V and W are already well-calibrated.
+
+### Inference ablation (`eval_inference.py`, geo-CV val, proxy C=4.0)
+| config | proxy | IoU_B | IoU_V | IoU_W | RMSE_B | RMSE_V |
+|--------|-------|-------|-------|-------|--------|--------|
+| raw | 0.3947 | 0.200 | 0.812 | 0.687 | 2.087 | 3.996 |
+| +threshold | 0.4040 | 0.237 | 0.812 | 0.688 | 2.087 | 3.996 |
+| +blend | 0.4048 | 0.241 | 0.812 | 0.687 | 2.087 | 3.996 |
+| +blend+threshold | 0.4042 | 0.238 | 0.812 | 0.688 | 2.087 | 3.996 |
+| TTA | 0.3973 | 0.200 | 0.812 | 0.689 | 2.067 | 3.975 |
+| **TTA+blend+threshold** | **0.4072** | 0.240 | 0.813 | 0.689 | 2.067 | 3.975 |
+
+The submitted config (TTA+blend+threshold) is the best on val (+0.0125 over raw).
+Two notes: **blend and threshold don't stack** (both lower the B bar; together
+overshoot slightly); **TTA is small but free** (RMSE ticks down).
+
+### Platform submission: `7A_geocv_baseline_tta` = **0.3575** (vs 2A_vegboost 0.3721)
+| Metric | 2A_vegboost | 7A_tta | Δ | weight |
+|--------|-------------|--------|-----|--------|
+| IoU_B | 0.3394 | 0.3403 | +0.001 | 0.25 |
+| IoU_V | 0.7649 | **0.7981** | **+0.033** | 0.15 |
+| IoU_W | 0.3695 | **0.4138** | **+0.044** | 0.15 |
+| RMSE_B | 2.27 m | 2.35 m | −0.08 | 0.25 |
+| RMSE_V | 3.74 m | **4.09 m** | **−0.35** | 0.20 |
+| **score** | **0.3721** | **0.3575** | **−0.0146** | |
+
+**Verdict: 7A genuinely improves segmentation (IoU_V +0.033, IoU_W +0.044, IoU_B
+tied) but loses the aggregate on one cliff.** RMSE_V = 4.09 m is **above the 3.9 m
+scoring floor**, so the vegetation-height term contributes **exactly 0**
+(`0.20·max(0,1−4.09/3.9)=0`); 2A's 3.74 m squeaked under and earned ~0.008. That
+term swing plus slightly-worse RMSE_B is the whole −0.015 gap.
+
+### Diagnosis (drives Phase 5)
+1. **RMSE_V over the cliff** is the #1 problem and is **training-side, not
+   inference**. Smoking gun: `DualPathLoss` has **no vegetation-height boost**,
+   whereas 2A's loss did (its `veg_height_boost`, +0.006 platform, kept RMSE_V
+   under the floor). Dropped in the clean rebuild — prime suspect.
+2. **IoU_W collapses train→test** (val 0.689 → platform 0.414): water overfits to
+   the training regions. Geo-CV is exposing real domain-shift on water.
+3. The inference stack is already optimal — do not change it; do not re-submit
+   the same model.
+
+### Submission filename bug (fixed)
+First submission rejected: "additional files not required". Cause: `predict_7a`
+named outputs from `tile['core_id']`, which strips the year → `3001_BE.npy`. The
+platform requires `NNNN_AA_YYYY` (`3001_BE_2023`). Fixed `predict.py` to derive
+the stem via `extract_core_id_from_filename(tile['alpha_path'])` (keeps year);
+verified 946/946 match, unique. Existing predictions were renamed in place
+(content byte-identical) to avoid a 110-min re-predict.
+
+### Files
+- New: `threshold_scan.py`, `eval_inference.py`.
+- Fixed: `predict.py` (output naming), `package.py` + `uploader/submit.py`
+  (`_resolve_runs_dir()` for the head-node runs path).
+- `.gitignore`: added `uploader/cookies.json`, `*.png`, `nohup.out`.
+
+---
+
+## Phase 5 — Plan (post-baseline ablations)
+
+Priority is set by the platform breakdown: recover the **RMSE_V cliff** first
+(biggest score lever), then **water generalization**, then the structural claims.
+
+### P5.1 — Vegetation-height boost in the loss  ⟵ HIGHEST VALUE
+RMSE_V 4.09 m → under 3.9 m would flip a 0.0 term into ~+0.01–0.02 platform.
+Add a weighted height term where vegetation is present, mirroring 2A's win:
+```
+L_height += w_veg · Huber(pred,target,δ=0.5) on (veg_frac > 0.1)
+```
+Start `w_veg ≈ 2–3`. Also consider de-weighting GradNorm's freedom to starve
+height late (epoch-29 best had height weight already declining). Re-train fold 0,
+re-evaluate; this is a `DualPathLoss` change only (additive — keep the old class
+path intact for A/B). Expected: RMSE_V back under floor, small RMSE_B help.
+
+### P5.2 — Water generalization (IoU_W 0.69 val → 0.41 test)
+The largest train→test collapse. Options, cheapest first:
+- Stronger domain-shift augmentation on the channels water relies on.
+- Check whether water tiles cluster in particular geo folds (fold imbalance).
+- A dedicated water-aware term or light decoder branch (only if the above
+  doesn't recover it).
+
+### P5.3 — Structural ablations (the 6 spec claims), each vs the P5.1 baseline
+1. THOR_s1→height, THOR_s2→fraction (added alongside TerraMind).
+2. Disable encoder modality split (concat α+τ, single encoder).
+3. Disable decoder task split (single shared decoder).
+4. Both S1 and S2 to both decoders.
+5. Patches at encoder bottleneck instead of decoder skips.
+6. Drop the auxiliary binary B head.
+
+### P5.4 — Robustness / cheap wins
+- Stem deviation: spec's downsample-to-32 stem vs the full-res 96ch@256 we built.
+- Coverage metric: thresholded (spec) vs continuous (current) for the sampler.
+- 3-seed ensemble of the best config for the final submission.
+- Quiet the cosmetic `config.py` "Local NVMe not found" warning on the head node.
+
+### Submission discipline
+12 h limit; human decides each one. Next submission should be a model that
+clears RMSE_V < 3.9 m on val (P5.1), not a re-run of the current one.

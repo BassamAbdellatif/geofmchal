@@ -572,7 +572,11 @@ def predict_7a(args, exp_dir, params):
                         frac[c] = _apply_threshold_remap(frac[c], float(t))
 
             pred_np = np.concatenate([frac, height[None]], axis=0).astype(np.float32)
-            np.save(os.path.join(predictions_dir, f"{tile['core_id']}.npy"), pred_np)
+            # Output filename must match the platform's NNNN_AA_YYYY convention
+            # (keeps the year, unlike the modality-matching core_id). Derive it
+            # from the alpha test file's basename.
+            out_stem = extract_core_id_from_filename(tile["alpha_path"])
+            np.save(os.path.join(predictions_dir, f"{out_stem}.npy"), pred_np)
 
     print(f"  Predictions saved to: {predictions_dir}")
     if pred_np is not None:
