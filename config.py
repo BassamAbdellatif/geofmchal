@@ -22,21 +22,36 @@ os.environ["GDAL_SHARED_FILE_LIMIT"] = "50"
 from dataclasses import dataclass
 
 LOCAL_DATA_ROOT = "/scratch/geofm_data"
+HEAD_DATA_ROOT = "/mnt/head/users/bassam/data/geofmdata/embed2heights/data"
+HEAD_RUNS_DIR = "/mnt/head/users/bassam/data/geofmdata/runs"
 SHARED_DATA_ROOT = "/mnt/shared/geofm_data"
-SHARED_RUNS_DIR = "/mnt/shared/geofm_data/runs"
 
-if not os.path.exists(SHARED_RUNS_DIR):
-    try:
-        os.makedirs(SHARED_RUNS_DIR, exist_ok=True)
-    except Exception:
-        pass
-
+# Resolve the data root: fast local NVMe first, then the head-node NFS (which is
+# effectively local on the head), then the generic shared NFS as a last resort.
 if os.path.exists(LOCAL_DATA_ROOT):
     TARGET_DRIVE = LOCAL_DATA_ROOT
-    print(f"[{socket.gethostname()}] Success: Routing data to fast local NVMe -> {TARGET_DRIVE}")
+    SHARED_RUNS_DIR = "/mnt/shared/geofm_data/runs"
+    _route_msg = f"[{socket.gethostname()}] Routing data to local NVMe -> {TARGET_DRIVE}"
+elif os.path.exists(HEAD_DATA_ROOT):
+    TARGET_DRIVE = HEAD_DATA_ROOT
+    SHARED_RUNS_DIR = HEAD_RUNS_DIR
+    _route_msg = f"[{socket.gethostname()}] Routing data to head NFS -> {TARGET_DRIVE}"
 else:
     TARGET_DRIVE = SHARED_DATA_ROOT
-    print(f"[{socket.gethostname()}] Warning: Local NVMe not found. Routing data to shared NFS -> {TARGET_DRIVE}")
+    SHARED_RUNS_DIR = "/mnt/shared/geofm_data/runs"
+    _route_msg = f"[{socket.gethostname()}] WARNING: no local/head data root found, using {TARGET_DRIVE}"
+
+try:
+    os.makedirs(SHARED_RUNS_DIR, exist_ok=True)
+except Exception:
+    pass
+
+# Print the routing line once per process tree. DataLoader workers spawned after
+# this import inherit GEOFM_CONFIG_QUIET=1 and stay silent, so the message no
+# longer repeats per worker.
+if not os.environ.get("GEOFM_CONFIG_QUIET"):
+    print(_route_msg)
+    os.environ["GEOFM_CONFIG_QUIET"] = "1"
 
 # Paths to training data subdirectories
 ALPHA_EARTH_DIR = os.path.join(TARGET_DRIVE, "train", "alphaearth_emb")

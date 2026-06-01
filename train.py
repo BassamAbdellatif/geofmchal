@@ -140,6 +140,9 @@ def parse_args():
     parser.add_argument("--use-gradnorm", action=argparse.BooleanOptionalAction, default=True, help="[7A] Learn task loss weights with GradNorm (default True). Used in Phase 3.")
     parser.add_argument("--use-thor", action=argparse.BooleanOptionalAction, default=False, help="[7A] Include THOR embeddings (default False; Phase 5 ablation).")
     parser.add_argument("--max-batches", type=int, default=0, help="If >0, cap batches per epoch (smoke testing).")
+    parser.add_argument("--veg-height-boost", type=float, default=0.0,
+                        help="[7A P5.1] Extra weight on masked Huber for vegetation pixels "
+                             "(veg_frac>0.1). 0.0 = Phase-4 baseline; try 2-3 to lower RMSE_V.")
     return parser.parse_args()
 
 
@@ -560,6 +563,7 @@ def train_7a(args):
         f.write(f"BATCH_SIZE: {args.batch_size}\n")
         f.write(f"EPOCHS: {args.epochs}\n")
         f.write(f"CV_FOLD: {args.cv_fold}\n")
+        f.write(f"VEG_HEIGHT_BOOST: {args.veg_height_boost}\n")
         f.write(f"USE_STRATIFIED_SAMPLER: {args.use_stratified_sampler}\n")
         f.write(f"USE_GRADNORM: {args.use_gradnorm}\n")
         f.write(f"USE_THOR: {args.use_thor}\n")
@@ -594,7 +598,7 @@ def train_7a(args):
     model = model.to(device)
     print(f"   >> params: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
 
-    criterion = DualPathLoss().to(device)
+    criterion = DualPathLoss(veg_height_boost=args.veg_height_boost).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
