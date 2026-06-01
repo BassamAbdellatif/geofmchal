@@ -226,12 +226,20 @@ class DualPathLoss(nn.Module):
     """
 
     def __init__(self, dice_lambda=1.0, dice_k=5.0, huber_delta=0.5,
-                 height_bg_weight=0.1):
+                 height_bg_weight=0.1, veg_height_boost=0.0, veg_boost_thresh=0.1):
+        """
+        veg_height_boost: extra weight on the masked Huber for vegetation pixels
+            (veg_frac > veg_boost_thresh). Default 0.0 reproduces the Phase-4
+            baseline exactly; set >0 (e.g. 2-3) to pull RMSE_V back under the
+            3.9 m scoring floor — mirrors the veg_height_boost that helped 2A.
+        """
         super().__init__()
         self.dice_lambda = dice_lambda
         self.dice_k = dice_k
         self.huber_delta = huber_delta
         self.height_bg_weight = height_bg_weight
+        self.veg_height_boost = veg_height_boost
+        self.veg_boost_thresh = veg_boost_thresh
 
     def forward(self, outputs, target):
         frac_logits = outputs["fraction"]          # (B,3,H,W)
@@ -260,6 +268,15 @@ class DualPathLoss(nn.Module):
         bg_sum = bg.sum().clamp_min(1.0)
         loss_height = (huber * mask).sum() / m_sum \
             + self.height_bg_weight * (huber * bg).sum() / bg_sum
+
+        # Vegetation-height boost: extra weighted Huber where vegetation is
+        # present, to drive RMSE_V down (the 3.9 m scoring-floor term). Mean over
+        # the veg-pixel count so the term is scale-comparable to the masked Huber.
+        if self.veg_height_boost > 0.0:
+            veg_mask = (veg_frac > self.veg_boost_thresh).float()
+            veg_sum = veg_mask.sum().clamp_min(1.0)
+            loss_height = loss_height \
+                + self.veg_height_boost * (huber * veg_mask).sum() / veg_sum
 
         # Aux binary building head: BCE + soft Dice on (build_frac > 0.5).
         bin_target = (build_frac > 0.5).float()
