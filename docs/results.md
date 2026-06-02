@@ -317,3 +317,93 @@ The inference ablation also revealed: +blend alone outperforms +blend+threshold 
 | 3-seed ensemble | Inference | +0.005–0.01 | 📋 7A Phase 5 |
 | Full-dataset training (no val split) for final ensemble | Training | +0.005–0.01 | 📋 final submission only |
 | Guided filter on height output | Post-processing | small | ❌ deferred |
+
+---
+
+## 7A Phase 5 — Ablation Campaign (5B + 5C)
+
+Two ablation rounds on the 7A `DualEncDualDecFusion` model, geographic CV fold 0,
+NVMe-cached tiles, one run per cluster node. 5B varied data/loss knobs (90 epochs,
+GradNorm, vegboost 1.0); 5C varied training strategy + two architecture components
+via additive **default-off CLI flags** (60 epochs, seed 0). The 5C flags
+(`--static-weights`, `--no-height-bridge`, `--no-binary-head`, `--seed`) are
+default-preserving — a forward pass without them is byte-identical to the pre-flag
+model (verified max_abs_diff = 0 on all output channels).
+
+### Phase 5B — data / loss ablations (90 epochs, GradNorm, stratified on)
+
+| Run | Proxy | IoU_B | IoU_V | IoU_W | RMSE_B | RMSE_V | Best ep |
+|-----|-------|-------|-------|-------|--------|--------|---------|
+| 7A_base_e90 (all on) | 0.396 | 0.206 | 0.808 | 0.686 | 2.14 | 3.92 | 59 |
+| 7A_no_vegboost_e90 | 0.399 | 0.204 | 0.809 | 0.684 | 2.09 | 3.91 | 40 |
+| 7A_no_gradnorm_e90 | 0.393 | 0.206 | 0.810 | 0.680 | 2.15 | 3.97 | 40 |
+| 7A_no_stratified_e90 | 0.287 | 0.200 | 0.809 | **0.000** | 2.15 | 4.03 | 65 |
+
+Isolated contribution (baseline − ablation): **stratified +0.108**, GradNorm +0.003,
+vegboost −0.004 (removing vegboost slightly *helped* the val proxy).
+
+### Phase 5C — architecture / training ablations (60 epochs, seed 0, static weights, stratified on)
+
+| Run | Changed vs `7A_simple` | Proxy | IoU_B | IoU_V | IoU_W | RMSE_B | RMSE_V | Best ep | mins |
+|-----|------------------------|-------|-------|-------|-------|--------|--------|---------|------|
+| **7A_simple** (reference) | — | **0.399** | **0.215** | 0.810 | 0.684 | 2.06 | 4.03 | 59 | 142 |
+| 7A_abl_no_bridge | drop α→height bridge | 0.294 | 0.213 | 0.808 | **0.000** | 2.08 | 4.12 | 34 | 141 |
+| 7A_abl_no_binary | drop aux binary head | 0.348 | **0.000** | 0.815 | 0.694 | 2.06 | 4.06 | 51 | 142 |
+| 7A_vegboost_high | vegboost 5.0 + GradNorm | 0.392 | 0.207 | 0.809 | 0.685 | 2.14 | 4.05 | 59 | 170 |
+
+`7A_simple` = static weights `[0.65,0.64,1.70]`, bridge on, binary on, **no GradNorm, no vegboost** — the recommended 7A baseline going forward.
+
+### 16. Rare classes collapse to exactly 0 on hard IoU without targeted signal
+
+The hard-IoU@0.5 metric punishes any rare class whose predictions sit below 0.5.
+Two components keep them above the line, and removing either drives the matching IoU
+to **0 for the entire run**: the **stratified sampler** (water → IoU_W=0 without it,
+5B) and the **auxiliary binary head** (buildings → IoU_B=0 without it, 5C). This is
+the central 7A lesson — buildings and water both sit right at the 0.5 boundary.
+
+### 17. veg_height_boost is structurally ineffective in 7A — drop it
+
+Inert at 1.0 (5B) and at 5.0 (5C): RMSE_V floors at **4.017m with boost vs 4.007m
+without** — no movement (marginally worse), and proxy lower (0.392 vs 0.399). RMSE_V
+plateaus ~4.0m regardless of boost strength. The 2A boost mechanism does not transfer
+to the 7A height decoder. Remove vegboost from 7A.
+
+### 18. GradNorm ≈ static weights — drop GradNorm
+
+`7A_simple` (static `[0.65,0.64,1.70]`) matches the GradNorm run exactly (proxy 0.399
+vs 0.399), with slightly better IoU_B (0.215 vs 0.204) and **16% less wall-time**
+(142 vs 170 min). Use the static converged weights; GradNorm earns nothing here.
+
+### 19. The auxiliary binary head is essential for IoU_B
+
+Dropping it zeros IoU_B for all 60 epochs (0.215 → 0.000) while IoU_V/W stay healthy.
+The binary head's BCE+Dice supervision is what carries building predictions over the
+0.5 threshold. As IoU_B is our #1 platform gap, keep the head and lean on post-blend
+threshold calibration at inference.
+
+### 20. The cross-encoder bridge does not improve RMSE_B (its stated purpose); ablation confounded
+
+RMSE_B is unchanged with/without the bridge (2.06 vs 2.08, Δ0.018m, far under the
+0.2m threshold) — the bridge is not measurably helping building height. The proxy
+drop is entirely an unexplained **IoU_W → 0 collapse** (architecturally implausible:
+the bridge feeds the height decoder, not water). Treat as a calibration/seed artifact
+pending a confirmation re-run; the bridge is cheap and default-on, so keep it for now.
+
+### 21. RMSE_V cliff is the binding constraint for a 7A submission
+
+Best 7A config floors RMSE_V at ~4.0m, above the **3.9m platform cliff** → 0 credit
+for the RMSE_V term (20% of the score), and vegboost (the intended fix) is now proven
+dead. A 7A standalone submission today would likely land ~0.36 — the same territory
+as the prior 7A submission (0.358) — and **tie/lose to 2A_vegboost (0.372)**. Do not
+spend a 12h submission slot on it.
+
+### Updated next steps (post-Phase-5C)
+
+| Action | Rationale | Priority |
+|--------|-----------|----------|
+| **Hybrid: `7A_simple` fraction/building channels + `2A_vegboost` height** | combines 7A's IoU strength with 2A's sub-cliff RMSE_V (3.74m) | 🔥 highest EV |
+| Inference threshold + blend-binary calibration on `7A_simple` (calibrate post-blend) | buildings borderline at 0.5; IoU_B is #1 gap | 🔥 cheap |
+| Adopt simplified 7A baseline: static weights, no GradNorm, no vegboost | equal/better, simpler, 16% faster | ✅ adopt |
+| Structurally attack RMSE_V (vegboost dead): why does the height decoder plateau at 4.0m? | RMSE_V is the only thing keeping 7A below 2A | 📋 research |
+| Confirm `no_bridge` IoU_W collapse with a seed re-run before removing the bridge | rule out artifact | 📋 |
+| ~~7A_vegboost retrain (was 🔥 highest priority)~~ | **DONE — vegboost confirmed ineffective (findings 17)** | ✅ closed (negative) |

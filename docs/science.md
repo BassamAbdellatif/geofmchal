@@ -306,3 +306,35 @@ Both are S1/S2 foundation models with different SSL objectives. Could be free en
 - Heavy HP search — spatial CV + principled design dominates HP tuning
 - Pure MSE losses — destroy IoU (6A and 2A_mse evidence)
 - Dynamic / curriculum loss weights — consistently hurt across 4A, 5A, 6A
+
+---
+
+## 9. Phase 5 Ablation Outcomes (7A: 5B + 5C)
+
+Empirical verdicts from the 7A ablation campaign (geographic CV fold 0; full tables
+in `results.md` § "7A Phase 5"). 5C tested two of the six structural claims via
+additive default-off flags. Claims 1–4 require model rewrites and were not run —
+claim 1 (single encoder) was deliberately skipped because the 6A evidence already
+shows α+τ concatenation destroys IoU_B and we would ship the dual encoder regardless.
+
+**Six structural claims — status after Phase 5:**
+
+| # | Claim | Tested? | Verdict |
+|---|-------|---------|---------|
+| 1 | Encoder modality split helps | No (skipped) | Assumed from 6A (concat α+τ destroys IoU_B 0.168→0.017) |
+| 2 | Decoder task split helps | No | Untested in 7A; 6A showed a shared decoder costs ~0.13 proxy |
+| 3 | Sensor-routed patches help | No | Untested |
+| 4 | Skip > bottleneck injection | No | Untested |
+| 5 | Cross-encoder bridge helps height | **Yes** | **No** — RMSE_B unchanged (2.06↔2.08); the bridge does not earn its stated purpose. Ablation confounded by an unexplained IoU_W→0 collapse — needs a seed re-run. |
+| 6 | Auxiliary binary head helps IoU_B | **Yes** | **Strongly yes** — removing it zeros IoU_B for the whole run. The most load-bearing architectural component for buildings. |
+
+**Training-strategy verdicts (outside the six claims):**
+- **Stratified sampling — essential.** Without it IoU_W → 0 (water vanishes at the hard 0.5 threshold). With claim 6, this is the central 7A lesson: rare classes (water, buildings) need targeted signal or they fall below 0.5 and score exactly zero on hard IoU.
+- **GradNorm — drop it.** Static converged weights `[0.65,0.64,1.70]` match GradNorm exactly (proxy 0.399) and run 16% faster.
+- **veg_height_boost — drop it.** Inert at 1.0 and at 5.0; RMSE_V plateaus ~4.0m regardless. The 2A boost mechanism does not transfer to the 7A height decoder.
+
+**Binding constraint.** RMSE_V floors at ~4.0m, above the 3.9m platform cliff → 0 RMSE_V credit (20% of the score). This caps a 7A standalone submission below the current best (2A_vegboost, 0.372). The recommended path is a **hybrid** (7A fraction/building channels + 2A height, which clears the cliff at 3.74m), not further 7A height tuning.
+
+**Updated open questions (§7):**
+- 7.2 (modality-to-task prior): partly answered — the *negative* version holds (mixing hurts buildings); the dual-encoder *positive* version remains untested (claim 1 skipped).
+- New — **why does 7A's height decoder plateau at RMSE_V ≈ 4.0m** while 2A reaches 3.74m? With vegboost ruled out as the lever, this is now the key height question.
