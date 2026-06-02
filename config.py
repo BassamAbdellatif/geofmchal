@@ -20,15 +20,31 @@ os.environ["GDAL_DISABLE_READDIR_ON_OPEN"] = "EMPTY_DIR"
 os.environ["GDAL_SHARED_FILE_LIMIT"] = "50"
 
 from dataclasses import dataclass
+import re
 
 LOCAL_DATA_ROOT = "/scratch/geofm_data"
 HEAD_DATA_ROOT = "/mnt/head/users/bassam/data/geofmdata/embed2heights/data"
 HEAD_RUNS_DIR = "/mnt/head/users/bassam/data/geofmdata/runs"
 SHARED_DATA_ROOT = "/mnt/shared/geofm_data"
 
-# Resolve the data root: fast local NVMe first, then the head-node NFS (which is
-# effectively local on the head), then the generic shared NFS as a last resort.
-if os.path.exists(LOCAL_DATA_ROOT):
+# On a compute node (hostname NARSSCNodeK) the full dataset is rsync'd to that
+# node's local disk at /mnt/nK/.../embed2heights/data. Reading raw labels/tiles
+# from there avoids the contended head NFS, which otherwise stalls data setup.
+_host = socket.gethostname()
+_node_match = re.search(r"Node(\d+)", _host, re.IGNORECASE)
+NODE_LOCAL_DATA_ROOT = (
+    f"/mnt/n{_node_match.group(1)}/users/bassam/data/geofmdata/embed2heights/data"
+    if _node_match else None
+)
+
+# Resolve the data root: this node's local disk first, then the legacy local
+# NVMe path, then the head-node NFS (effectively local on the head), then the
+# generic shared NFS as a last resort.
+if NODE_LOCAL_DATA_ROOT and os.path.exists(NODE_LOCAL_DATA_ROOT):
+    TARGET_DRIVE = NODE_LOCAL_DATA_ROOT
+    SHARED_RUNS_DIR = HEAD_RUNS_DIR  # persist runs centrally on head NFS
+    _route_msg = f"[{_host}] Routing data to node-local disk -> {TARGET_DRIVE}"
+elif os.path.exists(LOCAL_DATA_ROOT):
     TARGET_DRIVE = LOCAL_DATA_ROOT
     SHARED_RUNS_DIR = "/mnt/shared/geofm_data/runs"
     _route_msg = f"[{socket.gethostname()}] Routing data to local NVMe -> {TARGET_DRIVE}"
