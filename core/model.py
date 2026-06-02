@@ -337,7 +337,7 @@ def infer_model_type(n_channels):
     return "lightunet"
 
 
-def build_model(model_type, n_channels, n_classes):
+def build_model(model_type, n_channels, n_classes, use_height_bridge=True):
     selected = model_type.lower()
 
     if selected == "auto":
@@ -349,7 +349,7 @@ def build_model(model_type, n_channels, n_classes):
     if selected == "dual_enc_dec_fusion":
         # 7A: channels are fixed per modality (alpha=64, tessera=128, patches=768,
         # out=4). n_channels / n_classes are ignored for this architecture.
-        return DualEncDualDecFusion(), selected
+        return DualEncDualDecFusion(use_height_bridge=use_height_bridge), selected
 
     raise ValueError(
         f"Unknown model_type '{model_type}'. Use one of: auto, lightunet, "
@@ -596,10 +596,13 @@ class HeightDecoder(nn.Module):
     tokens are injected at the 16×16 and 32×32 levels. Outputs: 1 height channel.
     """
 
-    def __init__(self, bridge_alpha=0.2):
+    def __init__(self, bridge_alpha=0.2, use_bridge=True):
         super().__init__()
         self.bridge_alpha = bridge_alpha
+        self.use_bridge = use_bridge
         # Fuse τ-bottleneck (384) + α-bottleneck side input (384) -> 384.
+        # Always constructed (so param init/order is identical with or without the
+        # bridge); the forward only uses it when use_bridge is True.
         self.bridge = nn.Conv2d(_DEC[0] * 2, _DEC[0], 1, bias=False)
         self.inject16 = PatchCrossAttnBlock(dim_q=_DEC[0])   # 384 @ 16
         self.up1 = _UpBlock(_DEC[0], _ENC[3], _DEC[1])       # 16->32
@@ -610,8 +613,13 @@ class HeightDecoder(nn.Module):
         self.height_head = nn.Conv2d(_DEC[4], 1, 1)
 
     def forward(self, tau_bottleneck, tau_skips, alpha_bottleneck, s1_tokens):
-        a = grad_scale(alpha_bottleneck, self.bridge_alpha)
-        x = self.bridge(torch.cat([tau_bottleneck, a], dim=1))
+        if self.use_bridge:
+            a = grad_scale(alpha_bottleneck, self.bridge_alpha)
+            x = self.bridge(torch.cat([tau_bottleneck, a], dim=1))
+        else:
+            # No cross-encoder bridge: height decoder runs on the τ-bottleneck
+            # alone (skip the projection entirely; do not pass zeros through it).
+            x = tau_bottleneck
         x = self.inject16(x, s1_tokens)
         x = self.up1(x, tau_skips[3])
         x = self.inject32(x, s1_tokens)
@@ -637,7 +645,7 @@ class DualEncDualDecFusion(nn.Module):
     sigmoid to the fraction channels (height is left as the raw regression).
     """
 
-    def __init__(self, bridge_alpha=0.2):
+    def __init__(self, bridge_alpha=0.2, use_height_bridge=True):
         super().__init__()
         self.alpha_stem = AlphaStem()
         self.tessera_stem = TesseraStem()
@@ -646,7 +654,7 @@ class DualEncDualDecFusion(nn.Module):
         self.s1_token_stem = PatchTokenStem(768, 384)
         self.s2_token_stem = PatchTokenStem(768, 384)
         self.fraction_decoder = FractionDecoder()
-        self.height_decoder = HeightDecoder(bridge_alpha=bridge_alpha)
+        self.height_decoder = HeightDecoder(bridge_alpha=bridge_alpha, use_bridge=use_height_bridge)
 
     def forward(self, batch):
         alpha = batch["alpha_earth"]
