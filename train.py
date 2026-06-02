@@ -143,6 +143,12 @@ def parse_args():
     parser.add_argument("--veg-height-boost", type=float, default=0.0,
                         help="[7A P5.1] Extra weight on masked Huber for vegetation pixels "
                              "(veg_frac>0.1). 0.0 = Phase-4 baseline; try 2-3 to lower RMSE_V.")
+    parser.add_argument("--cache-dir", type=str, default=None,
+                        help="[7A] Directory for the memmap float16 tile cache. If set, "
+                             "tiles are preprocessed once and served from the (page-cached) "
+                             "memmap on later epochs — turns the IO-bound run compute-bound.")
+    parser.add_argument("--rebuild-cache", action="store_true",
+                        help="[7A] Force rebuild of the tile cache even if a .done flag exists.")
     return parser.parse_args()
 
 
@@ -485,7 +491,10 @@ def main():
 # 7A — Training path for DualEncDualDecFusion
 # =============================================================================
 
-DATA_ROOT_7A = "/mnt/head/users/bassam/data/geofmdata/embed2heights/data"
+# Resolve via config so compute nodes read raw tiles/labels from their local
+# disk (/mnt/nK/...) instead of the contended head NFS. Falls back to the head
+# path on the head node (where config.TARGET_DRIVE already points there).
+DATA_ROOT_7A = config.TARGET_DRIVE
 
 
 def _runs_dir_7a():
@@ -564,6 +573,7 @@ def train_7a(args):
         f.write(f"EPOCHS: {args.epochs}\n")
         f.write(f"CV_FOLD: {args.cv_fold}\n")
         f.write(f"VEG_HEIGHT_BOOST: {args.veg_height_boost}\n")
+        f.write(f"CACHE_DIR: {args.cache_dir}\n")
         f.write(f"USE_STRATIFIED_SAMPLER: {args.use_stratified_sampler}\n")
         f.write(f"USE_GRADNORM: {args.use_gradnorm}\n")
         f.write(f"USE_THOR: {args.use_thor}\n")
@@ -571,8 +581,10 @@ def train_7a(args):
 
     print("--- 7A Data Setup ---")
     tiles = find_multimodal_train_tiles(DATA_ROOT_7A)
-    train_ds = GeoFMDataset7A(tiles, is_train=True, cv_fold=args.cv_fold)
-    val_ds = GeoFMDataset7A(tiles, is_train=False, cv_fold=args.cv_fold)
+    train_ds = GeoFMDataset7A(tiles, is_train=True, cv_fold=args.cv_fold,
+                              cache_dir=args.cache_dir, rebuild_cache=args.rebuild_cache)
+    val_ds = GeoFMDataset7A(tiles, is_train=False, cv_fold=args.cv_fold,
+                            cache_dir=args.cache_dir, rebuild_cache=args.rebuild_cache)
     print(f"   >> matched={len(tiles)}  train={len(train_ds)}  val={len(val_ds)}  (cv_fold={args.cv_fold})")
 
     if args.use_stratified_sampler:

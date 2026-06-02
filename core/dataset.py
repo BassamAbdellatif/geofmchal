@@ -377,6 +377,8 @@ class GeoFMDataset7A(Dataset):
         geo_folds_path=_DEFAULT_GEO_FOLDS,
         norm_stats_path=_DEFAULT_NORM_STATS,
         cv_fold=0,
+        cache_dir=None,
+        rebuild_cache=False,
     ):
         with open(geo_folds_path) as f:
             folds = json.load(f)
@@ -390,6 +392,108 @@ class GeoFMDataset7A(Dataset):
         self.norm_stats = _load_norm_stats(norm_stats_path)
 
         self._coverage_scores = self._compute_coverage_scores()
+
+        # Optional memmap-backed float16 cache of the deterministic preprocessed
+        # tiles (sanitize+pad+reshape+norm). Built once; workers mmap it
+        # read-only so the OS page cache holds a single shared copy (spawn-safe,
+        # no per-worker duplication). Augmentation is still applied per __getitem__.
+        self._cache = None
+        if cache_dir is not None:
+            tag = f"fold{cv_fold}_{'train' if is_train else 'val'}"
+            self._init_cache(cache_dir, tag, rebuild_cache)
+
+    # ------------------------------------------------------------------ caching
+    _CACHE_SPECS = {
+        "alpha_earth":  (64, 256, 256),
+        "tessera":      (128, 256, 256),
+        "terramind_s1": (256, 768),
+        "terramind_s2": (256, 768),
+        "target":       (4, 256, 256),
+    }
+
+    def _preprocess_tile(self, tile):
+        """Deterministic read -> sanitize -> pad -> reshape -> norm. Returns f32 dict.
+        This is the cacheable part; augmentation happens after, per __getitem__."""
+        with rasterio.open(tile["alpha_path"]) as src:
+            alpha = src.read().astype(np.float32)
+        with rasterio.open(tile["tessera_path"]) as src:
+            tessera = src.read().astype(np.float32)
+        with rasterio.open(tile["tm_s1_path"]) as src:
+            tm_s1 = src.read().astype(np.float32)
+        with rasterio.open(tile["tm_s2_path"]) as src:
+            tm_s2 = src.read().astype(np.float32)
+        with rasterio.open(tile["label_path"]) as src:
+            target = src.read().astype(np.float32)
+
+        alpha   = _pad_to(_sanitize(alpha))
+        tessera = _pad_to(_sanitize(tessera))
+        tm_s1   = _sanitize(tm_s1).reshape(768, -1).T      # (256,768)
+        tm_s2   = _sanitize(tm_s2).reshape(768, -1).T
+        target  = _pad_to(np.nan_to_num(target))
+        target[3] = np.clip(target[3] / HEIGHT_NORM_CONSTANT, 0.0, 1.5)
+
+        if self.norm_stats:
+            alpha   = _apply_norm(alpha,   self.norm_stats["alpha_earth"]["mean"],  self.norm_stats["alpha_earth"]["std"])
+            tessera = _apply_norm(tessera, self.norm_stats["tessera"]["mean"],      self.norm_stats["tessera"]["std"])
+            tm_s1   = _apply_norm(tm_s1,   self.norm_stats["terramind_s1"]["mean"], self.norm_stats["terramind_s1"]["std"], channel_axis=-1)
+            tm_s2   = _apply_norm(tm_s2,   self.norm_stats["terramind_s2"]["mean"], self.norm_stats["terramind_s2"]["std"], channel_axis=-1)
+
+        return {"alpha_earth": alpha, "tessera": tessera,
+                "terramind_s1": tm_s1, "terramind_s2": tm_s2, "target": target}
+
+    def _init_cache(self, cache_dir, tag, rebuild):
+        os.makedirs(cache_dir, exist_ok=True)
+        n = len(self.tiles)
+        paths = {k: os.path.join(cache_dir, f"{tag}_{k}.f16.npy")
+                 for k in self._CACHE_SPECS}
+        done_flag = os.path.join(cache_dir, f"{tag}.done")
+
+        need_build = rebuild or not os.path.exists(done_flag) or \
+            any(not os.path.exists(p) for p in paths.values())
+
+        if need_build:
+            from tqdm import tqdm
+            if os.path.exists(done_flag):
+                os.remove(done_flag)
+            mm = {k: np.lib.format.open_memmap(
+                      paths[k], mode="w+", dtype=np.float16,
+                      shape=(n, *self._CACHE_SPECS[k]))
+                  for k in self._CACHE_SPECS}
+            gb = sum(np.prod((n, *s)) for s in self._CACHE_SPECS.values()) * 2 / 1e9
+            print(f"[cache] building {tag}: {n} tiles, ~{gb:.1f} GB f16 -> {cache_dir}")
+            for i, tile in enumerate(tqdm(self.tiles, desc=f"cache {tag}", leave=False)):
+                pp = self._preprocess_tile(tile)
+                for k in self._CACHE_SPECS:
+                    mm[k][i] = pp[k].astype(np.float16)
+            for k in mm:
+                mm[k].flush()
+            del mm
+            open(done_flag, "w").write(f"{n}\n")
+            print(f"[cache] {tag} built.")
+
+        # Store paths only; the read-only memmaps are opened lazily, once per
+        # process (see _ensure_cache). They must NOT live in the pickled dataset
+        # state: under the 'spawn' start method the DataLoader pickles the whole
+        # dataset to each worker, and pickling a np.memmap serialises the FULL
+        # array by value (~tens of GB) through a pipe, giving every worker its
+        # own in-RAM copy and OOM-ing the node. Opening lazily in each worker
+        # instead keeps a single shared copy in the OS page cache.
+        self._cache_paths = dict(paths)
+        self._cache = None
+
+    def _ensure_cache(self):
+        """Open the read-only f16 memmaps lazily, once per process."""
+        if self._cache is None and getattr(self, "_cache_paths", None):
+            self._cache = {k: np.load(p, mmap_mode="r")
+                           for k, p in self._cache_paths.items()}
+        return self._cache
+
+    def __getstate__(self):
+        # Never pickle live memmap handles into spawned workers; they are
+        # reopened lazily per process from self._cache_paths.
+        state = self.__dict__.copy()
+        state["_cache"] = None
+        return state
 
     def _compute_coverage_scores(self):
         """
@@ -439,34 +543,19 @@ class GeoFMDataset7A(Dataset):
         tile = self.tiles[idx]
         rng = np.random.default_rng()
 
-        with rasterio.open(tile["alpha_path"]) as src:
-            alpha = src.read().astype(np.float32)          # (64, 256, 256)
-        with rasterio.open(tile["tessera_path"]) as src:
-            tessera = src.read().astype(np.float32)        # (128, 256, 256)
-        with rasterio.open(tile["tm_s1_path"]) as src:
-            tm_s1 = src.read().astype(np.float32)          # (768, 16, 16)
-        with rasterio.open(tile["tm_s2_path"]) as src:
-            tm_s2 = src.read().astype(np.float32)          # (768, 16, 16)
-        with rasterio.open(tile["label_path"]) as src:
-            target = src.read().astype(np.float32)         # (4, 256, 256)
-
-        alpha   = _pad_to(_sanitize(alpha))
-        tessera = _pad_to(_sanitize(tessera))
-        tm_s1   = _sanitize(tm_s1)
-        tm_s2   = _sanitize(tm_s2)
-        target  = _pad_to(np.nan_to_num(target))
-
-        target[3] = np.clip(target[3] / HEIGHT_NORM_CONSTANT, 0.0, 1.5)
-
-        # Reshape patch tokens: (768, 16, 16) -> (256, 768)
-        tm_s1 = tm_s1.reshape(768, -1).T
-        tm_s2 = tm_s2.reshape(768, -1).T
-
-        if self.norm_stats:
-            alpha   = _apply_norm(alpha,   self.norm_stats["alpha_earth"]["mean"],  self.norm_stats["alpha_earth"]["std"])
-            tessera = _apply_norm(tessera, self.norm_stats["tessera"]["mean"],      self.norm_stats["tessera"]["std"])
-            tm_s1   = _apply_norm(tm_s1,   self.norm_stats["terramind_s1"]["mean"], self.norm_stats["terramind_s1"]["std"], channel_axis=-1)
-            tm_s2   = _apply_norm(tm_s2,   self.norm_stats["terramind_s2"]["mean"], self.norm_stats["terramind_s2"]["std"], channel_axis=-1)
+        cache = self._ensure_cache()
+        if cache is not None:
+            # Read the preprocessed f16 tile from the shared memmap; upcast to f32
+            # for augmentation/compute. (norm/sanitize/pad already baked in.)
+            alpha   = np.asarray(cache["alpha_earth"][idx],  dtype=np.float32)
+            tessera = np.asarray(cache["tessera"][idx],      dtype=np.float32)
+            tm_s1   = np.asarray(cache["terramind_s1"][idx], dtype=np.float32)
+            tm_s2   = np.asarray(cache["terramind_s2"][idx], dtype=np.float32)
+            target  = np.asarray(cache["target"][idx],       dtype=np.float32)
+        else:
+            pp = self._preprocess_tile(tile)
+            alpha, tessera = pp["alpha_earth"], pp["tessera"]
+            tm_s1, tm_s2, target = pp["terramind_s1"], pp["terramind_s2"], pp["target"]
 
         if self.is_train:
             emb_dict = {
