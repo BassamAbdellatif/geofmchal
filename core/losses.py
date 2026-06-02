@@ -226,7 +226,8 @@ class DualPathLoss(nn.Module):
     """
 
     def __init__(self, dice_lambda=1.0, dice_k=5.0, huber_delta=0.5,
-                 height_bg_weight=0.1, veg_height_boost=0.0, veg_boost_thresh=0.1):
+                 height_bg_weight=0.1, veg_height_boost=0.0, veg_boost_thresh=0.1,
+                 use_binary=True):
         """
         veg_height_boost: extra weight on the masked Huber for vegetation pixels
             (veg_frac > veg_boost_thresh). Default 0.0 reproduces the Phase-4
@@ -240,11 +241,11 @@ class DualPathLoss(nn.Module):
         self.height_bg_weight = height_bg_weight
         self.veg_height_boost = veg_height_boost
         self.veg_boost_thresh = veg_boost_thresh
+        self.use_binary = use_binary
 
     def forward(self, outputs, target):
         frac_logits = outputs["fraction"]          # (B,3,H,W)
         height_pred = outputs["height"][:, 0]      # (B,H,W)
-        bin_logits = outputs["binary"][:, 0]       # (B,H,W)
 
         frac_target = target[:, :3]                # (B,3,H,W) in [0,1]
         height_target = target[:, 3]               # (B,H,W) normalised
@@ -279,10 +280,17 @@ class DualPathLoss(nn.Module):
                 + self.veg_height_boost * (huber * veg_mask).sum() / veg_sum
 
         # Aux binary building head: BCE + soft Dice on (build_frac > 0.5).
-        bin_target = (build_frac > 0.5).float()
-        loss_bce = F.binary_cross_entropy_with_logits(bin_logits, bin_target)
-        loss_bin_dice = _soft_dice(torch.sigmoid(bin_logits), bin_target)
-        loss_binary = loss_bce + loss_bin_dice
+        # Phase 5C: with use_binary=False the term is dropped entirely (the head
+        # is left untrained); the key is still returned (= 0.0) so callers that
+        # log per-task losses keep working.
+        if self.use_binary:
+            bin_logits = outputs["binary"][:, 0]   # (B,H,W)
+            bin_target = (build_frac > 0.5).float()
+            loss_bce = F.binary_cross_entropy_with_logits(bin_logits, bin_target)
+            loss_bin_dice = _soft_dice(torch.sigmoid(bin_logits), bin_target)
+            loss_binary = loss_bce + loss_bin_dice
+        else:
+            loss_binary = torch.zeros((), device=frac_logits.device)
 
         return {"fraction": loss_fraction, "height": loss_height, "binary": loss_binary}
 

@@ -138,6 +138,7 @@ def parse_args():
     parser.add_argument("--cv-fold", type=int, default=0, help="[7A] Geographic CV fold to hold out for validation (0-4). See data/geo_folds.json.")
     parser.add_argument("--use-stratified-sampler", action=argparse.BooleanOptionalAction, default=True, help="[7A] Use WeightedRandomSampler over coverage strata (default True).")
     parser.add_argument("--use-gradnorm", action=argparse.BooleanOptionalAction, default=True, help="[7A] Learn task loss weights with GradNorm (default True). Used in Phase 3.")
+    parser.add_argument("--static-weights", type=str, default="0.65,0.64,1.70", help="[7A Phase 5C] Static task weights 'w_f,w_h,w_b' used when --no-use-gradnorm. Default = GradNorm-converged values from 7A_base_e90 ep59.")
     parser.add_argument("--use-thor", action=argparse.BooleanOptionalAction, default=False, help="[7A] Include THOR embeddings (default False; Phase 5 ablation).")
     parser.add_argument("--max-batches", type=int, default=0, help="If >0, cap batches per epoch (smoke testing).")
     parser.add_argument("--veg-height-boost", type=float, default=0.0,
@@ -149,6 +150,14 @@ def parse_args():
                              "memmap on later epochs — turns the IO-bound run compute-bound.")
     parser.add_argument("--rebuild-cache", action="store_true",
                         help="[7A] Force rebuild of the tile cache even if a .done flag exists.")
+    parser.add_argument("--no-height-bridge", action="store_true",
+                        help="[7A Phase 5C] Disable the alpha-bottleneck cross-encoder bridge "
+                             "into the height decoder (ablation; default keeps the bridge).")
+    parser.add_argument("--no-binary-head", action="store_true",
+                        help="[7A Phase 5C] Drop the auxiliary binary building loss term "
+                             "(the head is left untrained, removed from task weighting).")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="Global RNG seed (torch / numpy / random) for reproducibility.")
     return parser.parse_args()
 
 
@@ -556,6 +565,12 @@ def evaluate_7a(model, val_loader, criterion, device, C=4.0):
 
 
 def train_7a(args):
+    # Global reproducibility seed (overrides the module-level default seed).
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     runs_dir = _runs_dir_7a()
     exp_dir = os.path.join(runs_dir, args.experiment_name)
@@ -577,6 +592,10 @@ def train_7a(args):
         f.write(f"USE_STRATIFIED_SAMPLER: {args.use_stratified_sampler}\n")
         f.write(f"USE_GRADNORM: {args.use_gradnorm}\n")
         f.write(f"USE_THOR: {args.use_thor}\n")
+        f.write(f"STATIC_WEIGHTS: {args.static_weights}\n")
+        f.write(f"NO_HEIGHT_BRIDGE: {args.no_height_bridge}\n")
+        f.write(f"NO_BINARY_HEAD: {args.no_binary_head}\n")
+        f.write(f"SEED: {args.seed}\n")
         f.write(f"OPTIMIZER: AdamW lr={LEARNING_RATE} wd={WEIGHT_DECAY}\n")
 
     print("--- 7A Data Setup ---")
@@ -606,26 +625,37 @@ def train_7a(args):
     )
 
     print("--- 7A Model Init ---")
-    model, _ = build_model("dual_enc_dec_fusion", n_channels=64, n_classes=4)
+    model, _ = build_model("dual_enc_dec_fusion", n_channels=64, n_classes=4,
+                           use_height_bridge=not args.no_height_bridge)
     model = model.to(device)
-    print(f"   >> params: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
+    print(f"   >> params: {sum(p.numel() for p in model.parameters())/1e6:.2f}M"
+          f"  (height_bridge={'off' if args.no_height_bridge else 'on'})")
 
-    criterion = DualPathLoss(veg_height_boost=args.veg_height_boost).to(device)
+    criterion = DualPathLoss(veg_height_boost=args.veg_height_boost,
+                             use_binary=not args.no_binary_head).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    task_names = ["fraction", "height", "binary"]
+    # Drop the binary task entirely when the aux head is disabled, so GradNorm /
+    # static weighting never sees a constant-zero loss (which would NaN GradNorm).
+    task_names = ["fraction", "height"] if args.no_binary_head \
+        else ["fraction", "height", "binary"]
     use_gn = args.use_gradnorm
     if use_gn:
         balancer = GradNormBalancer(task_names, device, alpha=1.5, lr=0.025)
         ref_params = {
             "fraction": model.alpha_encoder.down4.block[0].weight,
-            "binary":   model.alpha_encoder.down4.block[0].weight,
             "height":   model.tessera_encoder.down4.block[0].weight,
         }
+        if not args.no_binary_head:
+            ref_params["binary"] = model.alpha_encoder.down4.block[0].weight
     else:
         balancer = None
-        static_w = {"fraction": 1.0, "height": 1.0, "binary": 1.0}
+        _sw = [float(x) for x in args.static_weights.split(",")]
+        if len(_sw) != 3:
+            raise ValueError(f"--static-weights expects 'w_f,w_h,w_b', got {args.static_weights!r}")
+        static_w = {"fraction": _sw[0], "height": _sw[1], "binary": _sw[2]}
+        print(f"   >> static task weights w[f/h/b] = {_sw[0]}/{_sw[1]}/{_sw[2]}")
 
     best_proxy = -1.0
     train_hist, proxy_hist = [], []
@@ -680,7 +710,8 @@ def train_7a(args):
         gn_str = ""
         if use_gn:
             wd = balancer.weight_dict()
-            gn_str = "  w[f/h/b]=%.2f/%.2f/%.2f" % (wd["fraction"], wd["height"], wd["binary"])
+            gn_str = "  w[f/h/b]=%.2f/%.2f/%.2f" % (
+                wd["fraction"], wd["height"], wd.get("binary", 0.0))
         print(f"Epoch {epoch+1}/{args.epochs} | train {epoch_loss:.4f} | "
               f"proxy {metrics['proxy']:.4f} | IoU B/V/W {metrics['iou_b']:.3f}/"
               f"{metrics['iou_v']:.3f}/{metrics['iou_w']:.3f} | RMSE B/V "
