@@ -339,7 +339,9 @@ def infer_model_type(n_channels):
 
 def build_model(model_type, n_channels, n_classes, use_height_bridge=True,
                 patch_inputs=("terramind_s1", "terramind_s2"),
-                patch_stem_version="v2", xattn_heads=4):
+                patch_stem_version="v2", xattn_heads=4,
+                patch_routing="sensor",
+                use_fraction_bridge=False, fraction_bridge_alpha=0.2):
     selected = model_type.lower()
 
     if selected == "auto":
@@ -356,6 +358,9 @@ def build_model(model_type, n_channels, n_classes, use_height_bridge=True,
             patch_inputs=patch_inputs,
             patch_stem_version=patch_stem_version,
             xattn_heads=xattn_heads,
+            patch_routing=patch_routing,
+            use_fraction_bridge=use_fraction_bridge,
+            fraction_bridge_alpha=fraction_bridge_alpha,
         ), selected
 
     raise ValueError(
@@ -623,8 +628,15 @@ class FractionDecoder(nn.Module):
     Outputs: 3 fraction channels + 1 auxiliary binary-building channel.
     """
 
-    def __init__(self, xattn_heads=4):
+    def __init__(self, xattn_heads=4, use_bridge=False, bridge_alpha=0.2):
         super().__init__()
+        # [Phase 5E #1] Optional τ-bottleneck → fraction bridge, mirror of the
+        # height bridge. Constructed only when enabled, so the default path is
+        # byte-identical (no extra params / no init-RNG shift) to 7A_simple.
+        self.use_fbridge = use_bridge
+        self.fbridge_alpha = bridge_alpha
+        if use_bridge:
+            self.fbridge = nn.Conv2d(_DEC[0] * 2, _DEC[0], 1, bias=False)
         self.inject16 = PatchCrossAttnBlock(dim_q=_DEC[0], heads=xattn_heads)   # 384 @ 16
         self.up1 = _UpBlock(_DEC[0], _ENC[3], _DEC[1])       # 16->32,  skip 256@32
         self.inject32 = PatchCrossAttnBlock(dim_q=_DEC[1], heads=xattn_heads)   # 256 @ 32
@@ -634,7 +646,12 @@ class FractionDecoder(nn.Module):
         self.frac_head = nn.Conv2d(_DEC[4], 3, 1)
         self.binary_head = nn.Conv2d(_DEC[4], 1, 1)
 
-    def forward(self, bottleneck, skips, s2_tokens):
+    def forward(self, bottleneck, skips, s2_tokens, tessera_bottleneck=None):
+        # [Phase 5E #1] Optional cross-encoder bridge: fuse the τ-bottleneck into
+        # the fraction path's first block (GradScale protects the τ/height encoder).
+        if self.use_fbridge and tessera_bottleneck is not None:
+            t = grad_scale(tessera_bottleneck, self.fbridge_alpha)
+            bottleneck = self.fbridge(torch.cat([bottleneck, t], dim=1))
         # s2_tokens is None when no *_s2 patch streams are active -> the fraction
         # decoder runs on the α-encoder features alone (no patch injection).
         x = self.inject16(bottleneck, s2_tokens) if s2_tokens is not None else bottleneck
@@ -722,11 +739,20 @@ class DualEncDualDecFusion(nn.Module):
 
     def __init__(self, bridge_alpha=0.2, use_height_bridge=True,
                  patch_inputs=("terramind_s1", "terramind_s2"),
-                 patch_stem_version="v2", xattn_heads=4):
+                 patch_stem_version="v2", xattn_heads=4,
+                 patch_routing="sensor",
+                 use_fraction_bridge=False, fraction_bridge_alpha=0.2):
         super().__init__()
         self.patch_inputs = list(patch_inputs)
         self.patch_stem_version = patch_stem_version
         self.xattn_heads = xattn_heads
+        # [Phase 5E #4] sensor->branch routing. 'sensor' (default) = byte-identical
+        # 7A: s1->height, s2->fraction. 's1-both' also feeds s1 into the fraction
+        # branch (SAR for water/building). 'all-both' feeds everything to both.
+        if patch_routing not in ("sensor", "s1-both", "all-both"):
+            raise ValueError(f"Unknown patch_routing {patch_routing!r}; "
+                             f"use 'sensor', 's1-both', or 'all-both'.")
+        self.patch_routing = patch_routing
         self.alpha_stem = AlphaStem()
         self.tessera_stem = TesseraStem()
         self.alpha_encoder = UNetEncoderHalf()
@@ -738,7 +764,9 @@ class DualEncDualDecFusion(nn.Module):
             self.token_stems[name] = _make_patch_stem(patch_stem_version, 768, 384)
         self._s1_names = [n for n in self.patch_inputs if n.endswith("_s1")]
         self._s2_names = [n for n in self.patch_inputs if n.endswith("_s2")]
-        self.fraction_decoder = FractionDecoder(xattn_heads=xattn_heads)
+        self.fraction_decoder = FractionDecoder(xattn_heads=xattn_heads,
+                                                use_bridge=use_fraction_bridge,
+                                                bridge_alpha=fraction_bridge_alpha)
         self.height_decoder = HeightDecoder(bridge_alpha=bridge_alpha,
                                             use_bridge=use_height_bridge,
                                             xattn_heads=xattn_heads)
@@ -749,17 +777,33 @@ class DualEncDualDecFusion(nn.Module):
         proj = [self.token_stems[n](batch[n]) for n in names]
         return proj[0] if len(proj) == 1 else torch.cat(proj, dim=1)
 
+    @staticmethod
+    def _cat_tokens(*toks):
+        toks = [t for t in toks if t is not None]
+        if not toks:
+            return None
+        return toks[0] if len(toks) == 1 else torch.cat(toks, dim=1)
+
     def forward(self, batch):
         alpha = batch["alpha_earth"]
         tessera = batch["tessera"]
         s1 = self._route_tokens(batch, self._s1_names)
         s2 = self._route_tokens(batch, self._s2_names)
 
+        # [Phase 5E #4] decide which token set each decoder attends over.
+        if self.patch_routing == "sensor":
+            frac_tok, height_tok = s2, s1
+        elif self.patch_routing == "s1-both":
+            frac_tok, height_tok = self._cat_tokens(s2, s1), s1
+        else:  # all-both
+            both = self._cat_tokens(s1, s2)
+            frac_tok, height_tok = both, both
+
         a_skips, a_bottleneck = self.alpha_encoder(self.alpha_stem(alpha))
         t_skips, t_bottleneck = self.tessera_encoder(self.tessera_stem(tessera))
 
-        frac, binary = self.fraction_decoder(a_bottleneck, a_skips, s2)
-        height = self.height_decoder(t_bottleneck, t_skips, a_bottleneck, s1)
+        frac, binary = self.fraction_decoder(a_bottleneck, a_skips, frac_tok, t_bottleneck)
+        height = self.height_decoder(t_bottleneck, t_skips, a_bottleneck, height_tok)
 
         return {"fraction": frac, "height": height, "binary": binary}
 

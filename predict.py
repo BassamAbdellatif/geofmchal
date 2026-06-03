@@ -581,13 +581,19 @@ def predict_7a(args, exp_dir, params):
     patch_stem_version = params.get("PATCH_STEM_VERSION", "v1").strip()
     xattn_heads = int(params.get("XATTN_HEADS", "4"))
     use_height_bridge = params.get("NO_HEIGHT_BRIDGE", "False").strip().lower() != "true"
+    patch_routing = params.get("PATCH_ROUTING", "sensor").strip()
+    use_fraction_bridge = params.get("USE_FRACTION_BRIDGE", "False").strip().lower() == "true"
+    fraction_bridge_alpha = float(params.get("FRACTION_BRIDGE_ALPHA", "0.2"))
     use_thor = any(p.startswith("thor") for p in patch_names)
 
     model, _ = build_model("dual_enc_dec_fusion", n_channels=64, n_classes=4,
                            use_height_bridge=use_height_bridge,
                            patch_inputs=patch_names,
                            patch_stem_version=patch_stem_version,
-                           xattn_heads=xattn_heads)
+                           xattn_heads=xattn_heads,
+                           patch_routing=patch_routing,
+                           use_fraction_bridge=use_fraction_bridge,
+                           fraction_bridge_alpha=fraction_bridge_alpha)
     model = model.to(device)
     state = torch.load(model_path, map_location=device)
     state = _remap_legacy_7a_state_dict(state, model)
