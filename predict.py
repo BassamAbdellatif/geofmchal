@@ -448,29 +448,62 @@ _NORM_STATS_7A = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "data", "norm_stats.json")
 
 
-def _load_test_tile_7a(tile, norm_stats):
-    """Preprocess one test tile exactly like the dataset val path (no aug)."""
+# Maps a patch-input name to its key in the test-tile dict (find_multimodal_test_tiles).
+_PATCH_NAME_TO_TILEKEY = {
+    "terramind_s1": "tm_s1_path",
+    "terramind_s2": "tm_s2_path",
+    "thor_s1":      "thor_s1_path",
+    "thor_s2":      "thor_s2_path",
+}
+
+
+def _load_test_tile_7a(tile, norm_stats, patch_names=("terramind_s1", "terramind_s2")):
+    """Preprocess one test tile exactly like the dataset val path (no aug).
+    Loads each active patch stream (terramind / thor) under its model-facing name."""
     def _read(p):
         with rasterio.open(p) as src:
             return src.read().astype(np.float32)
 
     alpha = _pad_to(_sanitize(_read(tile["alpha_path"])))
     tessera = _pad_to(_sanitize(_read(tile["tessera_path"])))
-    tm_s1 = _sanitize(_read(tile["tm_s1_path"])).reshape(768, -1).T
-    tm_s2 = _sanitize(_read(tile["tm_s2_path"])).reshape(768, -1).T
 
     if norm_stats:
         alpha = _apply_norm(alpha, norm_stats["alpha_earth"]["mean"], norm_stats["alpha_earth"]["std"])
         tessera = _apply_norm(tessera, norm_stats["tessera"]["mean"], norm_stats["tessera"]["std"])
-        tm_s1 = _apply_norm(tm_s1, norm_stats["terramind_s1"]["mean"], norm_stats["terramind_s1"]["std"], channel_axis=-1)
-        tm_s2 = _apply_norm(tm_s2, norm_stats["terramind_s2"]["mean"], norm_stats["terramind_s2"]["std"], channel_axis=-1)
 
-    return {
+    batch = {
         "alpha_earth": torch.from_numpy(alpha).unsqueeze(0),
         "tessera": torch.from_numpy(tessera).unsqueeze(0),
-        "terramind_s1": torch.from_numpy(tm_s1).unsqueeze(0),
-        "terramind_s2": torch.from_numpy(tm_s2).unsqueeze(0),
     }
+    for name in patch_names:
+        arr = _sanitize(_read(tile[_PATCH_NAME_TO_TILEKEY[name]])).reshape(768, -1).T
+        if norm_stats:
+            arr = _apply_norm(arr, norm_stats[name]["mean"], norm_stats[name]["std"], channel_axis=-1)
+        batch[name] = torch.from_numpy(arr).unsqueeze(0)
+    return batch
+
+
+def _remap_legacy_7a_state_dict(state, model):
+    """Phase 5D renamed the two terramind stems (s1_token_stem/s2_token_stem) to
+    token_stems.terramind_s1/_s2. Remap pre-5D checkpoints so they still load
+    into the current model. Only applied when the checkpoint uses the old names
+    and the model expects the new ones."""
+    has_legacy = any(k.startswith(("s1_token_stem.", "s2_token_stem.")) for k in state)
+    if not has_legacy:
+        return state
+    expects_new = any(k.startswith("token_stems.") for k in model.state_dict())
+    if not expects_new:
+        return state
+    remapped = {}
+    for k, v in state.items():
+        if k.startswith("s1_token_stem."):
+            remapped["token_stems.terramind_s1." + k[len("s1_token_stem."):]] = v
+        elif k.startswith("s2_token_stem."):
+            remapped["token_stems.terramind_s2." + k[len("s2_token_stem."):]] = v
+        else:
+            remapped[k] = v
+    print("  (compat) remapped legacy s1/s2_token_stem keys -> token_stems.terramind_s1/_s2")
+    return remapped
 
 
 def _raw_logits_7a(model, batch):
@@ -490,8 +523,10 @@ def _tta_logits_7a(model, batch):
                 if flip:
                     x = torch.flip(x, dims=[-1])
                 b[key] = x
-            for key in ("terramind_s1", "terramind_s2"):
-                grid = batch[key].reshape(1, 16, 16, -1)
+            for key in batch:
+                if key in ("alpha_earth", "tessera"):
+                    continue
+                grid = batch[key].reshape(1, 16, 16, -1)        # any *_s1/*_s2 patch stream
                 grid = torch.rot90(grid, k, dims=[1, 2])
                 if flip:
                     grid = torch.flip(grid, dims=[2])
@@ -539,20 +574,37 @@ def predict_7a(args, exp_dir, params):
     if not os.path.exists(model_path):
         model_path = os.path.join(exp_dir, "model_last.pth")
 
-    model, _ = build_model("dual_enc_dec_fusion", n_channels=64, n_classes=4)
-    model = model.to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
-    model.eval()
-    print(f"  Loaded {model_path} | TTA={'on' if use_tta else 'off'} blend_binary={blend}")
+    # Reconstruct the architecture from training_params.txt (Phase 5D). Defaults
+    # reproduce a pre-5D run: terramind-only, v1 stem, 4 heads, bridge on.
+    patch_inputs_str = params.get("PATCH_INPUTS", "terramind_s1,terramind_s2")
+    patch_names = [p.strip() for p in patch_inputs_str.split(",") if p.strip()]
+    patch_stem_version = params.get("PATCH_STEM_VERSION", "v1").strip()
+    xattn_heads = int(params.get("XATTN_HEADS", "4"))
+    use_height_bridge = params.get("NO_HEIGHT_BRIDGE", "False").strip().lower() != "true"
+    use_thor = any(p.startswith("thor") for p in patch_names)
 
-    tiles = find_multimodal_test_tiles(DATA_ROOT_7A, use_thor=False)
+    model, _ = build_model("dual_enc_dec_fusion", n_channels=64, n_classes=4,
+                           use_height_bridge=use_height_bridge,
+                           patch_inputs=patch_names,
+                           patch_stem_version=patch_stem_version,
+                           xattn_heads=xattn_heads)
+    model = model.to(device)
+    state = torch.load(model_path, map_location=device)
+    state = _remap_legacy_7a_state_dict(state, model)
+    model.load_state_dict(state)
+    model.eval()
+    print(f"  Loaded {model_path} | patch={patch_names} stem={patch_stem_version} "
+          f"heads={xattn_heads} bridge={'on' if use_height_bridge else 'off'} | "
+          f"TTA={'on' if use_tta else 'off'} blend_binary={blend}")
+
+    tiles = find_multimodal_test_tiles(DATA_ROOT_7A, use_thor=use_thor)
     print(f"  Found {len(tiles)} test tiles.")
 
     pred_np = None
     desc = "Predicting 7A (TTA 8x)" if use_tta else "Predicting 7A"
     with torch.no_grad():
         for tile in tqdm(tiles, desc=desc):
-            batch = {k: v.to(device) for k, v in _load_test_tile_7a(tile, norm_stats).items()}
+            batch = {k: v.to(device) for k, v in _load_test_tile_7a(tile, norm_stats, patch_names).items()}
             logits = _tta_logits_7a(model, batch) if use_tta else _raw_logits_7a(model, batch)
             logits = logits.squeeze(0)                       # (5,H,W)
 
