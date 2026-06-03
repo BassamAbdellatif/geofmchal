@@ -91,6 +91,10 @@ def main():
                         help="Fold to exclude (used as validation)")
     parser.add_argument("--geo-folds", type=str, default=GEO_FOLDS_PATH)
     parser.add_argument("--output", type=str, default=OUTPUT_PATH)
+    parser.add_argument("--only", type=str, default=None,
+                        help="Comma-separated subset of modalities to (re)compute "
+                             "(e.g. 'thor_s1,thor_s2'). Other existing keys in the "
+                             "output file are preserved (merge, not overwrite).")
     args = parser.parse_args()
 
     with open(args.geo_folds) as f:
@@ -107,9 +111,26 @@ def main():
         "tessera":      "tessera_emb",
         "terramind_s1": "terramind_s1_emb",
         "terramind_s2": "terramind_s2_emb",
+        "thor_s1":      "thor_s1_emb",
+        "thor_s2":      "thor_s2_emb",
     }
 
+    if args.only:
+        wanted = [m.strip() for m in args.only.split(",") if m.strip()]
+        for m in wanted:
+            if m not in modalities:
+                raise ValueError(f"Unknown modality '{m}'. Valid: {list(modalities)}")
+        modalities = {k: v for k, v in modalities.items() if k in wanted}
+        print(f"Subset mode (--only): computing {list(modalities)}; "
+              f"preserving other existing keys.")
+
+    # Merge into existing stats rather than overwrite, so a subset recompute
+    # (e.g. THOR) never disturbs already-validated terramind/alpha/tessera stats.
     stats = {}
+    if os.path.exists(args.output):
+        with open(args.output) as f:
+            stats = json.load(f)
+
     for name, subdir in modalities.items():
         all_files = sorted(glob.glob(os.path.join(train_dir, subdir, "*.tif")))
         files = [f for f in all_files if _normalize_id(f) in train_ids]
@@ -122,7 +143,7 @@ def main():
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
     with open(args.output, "w") as f:
         json.dump(stats, f, indent=2)
-    print(f"\nWritten: {args.output}")
+    print(f"\nWritten: {args.output}  (keys: {sorted(stats)})")
 
 
 if __name__ == "__main__":

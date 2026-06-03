@@ -182,10 +182,12 @@ _DEFAULT_NORM_STATS = os.path.join(_REPO_ROOT, "data", "norm_stats.json")
 _STRATA_WEIGHTS = [1.0, 1.5, 2.0, 3.0]
 
 
-def find_multimodal_train_tiles(data_root):
+def find_multimodal_train_tiles(data_root, use_thor=False):
     """
-    Match tiles across alpha_earth, tessera, terramind_s1, terramind_s2, and labels.
-    Returns a list of dicts: {core_id, alpha_path, tessera_path, tm_s1_path, tm_s2_path, label_path}
+    Match tiles across alpha_earth, tessera, terramind_s1, terramind_s2, labels
+    (and optionally thor_s1/thor_s2 when use_thor=True).
+    Returns a list of dicts: {core_id, alpha_path, tessera_path, tm_s1_path,
+    tm_s2_path, label_path [, thor_s1_path, thor_s2_path]}.
     """
     train_dir = os.path.join(data_root, "train")
     dirs = {
@@ -195,26 +197,36 @@ def find_multimodal_train_tiles(data_root):
         "tm_s2":   os.path.join(train_dir, "terramind_s2_emb"),
         "label":   os.path.join(train_dir, "labels"),
     }
+    if use_thor:
+        dirs["thor_s1"] = os.path.join(train_dir, "thor_s1_emb")
+        dirs["thor_s2"] = os.path.join(train_dir, "thor_s2_emb")
 
     id_maps = {}
     for key, d in dirs.items():
         files = glob.glob(os.path.join(d, "*.tif"))
         id_maps[key] = {_normalize_core_id(f): f for f in files}
 
+    required = ["tessera", "tm_s1", "tm_s2", "label"]
+    if use_thor:
+        required += ["thor_s1", "thor_s2"]
     common = set(id_maps["alpha"].keys())
-    for key in ("tessera", "tm_s1", "tm_s2", "label"):
+    for key in required:
         common &= set(id_maps[key].keys())
 
     tiles = []
     for cid in sorted(common):
-        tiles.append({
+        entry = {
             "core_id":      cid,
             "alpha_path":   id_maps["alpha"][cid],
             "tessera_path": id_maps["tessera"][cid],
             "tm_s1_path":   id_maps["tm_s1"][cid],
             "tm_s2_path":   id_maps["tm_s2"][cid],
             "label_path":   id_maps["label"][cid],
-        })
+        }
+        if use_thor:
+            entry["thor_s1_path"] = id_maps["thor_s1"][cid]
+            entry["thor_s2_path"] = id_maps["thor_s2"][cid]
+        tiles.append(entry)
     return tiles
 
 
@@ -323,7 +335,7 @@ def augment_domain_shift(emb_dict, norm_stats, rng):
             emb = emb + noise
         emb_dict[key] = emb
 
-    for key in ("terramind_s1", "terramind_s2"):
+    for key in ("terramind_s1", "terramind_s2", "thor_s1", "thor_s2"):
         if key not in emb_dict:
             continue
         emb = emb_dict[key]          # (N, D) float32  N=256, D=768
@@ -379,7 +391,14 @@ class GeoFMDataset7A(Dataset):
         cv_fold=0,
         cache_dir=None,
         rebuild_cache=False,
+        patch_inputs=("terramind_s1", "terramind_s2"),
     ):
+        # Active THOR patch streams (subset of thor_s1, thor_s2). When empty the
+        # dataset behaves byte-identically to the pre-Phase-5D version: same cache
+        # specs, same __getitem__ output keys, same augmentation RNG draw order.
+        self.patch_inputs = list(patch_inputs)
+        self._thor_streams = [n for n in self.patch_inputs if n.startswith("thor")]
+
         with open(geo_folds_path) as f:
             folds = json.load(f)
 
@@ -390,6 +409,23 @@ class GeoFMDataset7A(Dataset):
 
         self.is_train = is_train
         self.norm_stats = _load_norm_stats(norm_stats_path)
+
+        # Per-instance cache spec: base modalities + any active THOR streams.
+        # The class-level _CACHE_SPECS stays the byte-identical base set.
+        self._cache_specs = dict(self._CACHE_SPECS)
+        for name in self._thor_streams:
+            self._cache_specs[name] = (256, 768)
+
+        # THOR streams must have norm stats when normalisation is on, otherwise
+        # they'd be fed unnormalised while TerraMind is normalised (silent skew).
+        if self._thor_streams and self.norm_stats:
+            missing = [n for n in self._thor_streams if n not in self.norm_stats]
+            if missing:
+                raise KeyError(
+                    f"norm_stats.json is missing THOR keys {missing}. Run "
+                    f"compute_norm_stats.py --only {','.join(missing)} to add them "
+                    f"before training/caching with THOR."
+                )
 
         self._coverage_scores = self._compute_coverage_scores()
 
@@ -438,16 +474,32 @@ class GeoFMDataset7A(Dataset):
             tm_s1   = _apply_norm(tm_s1,   self.norm_stats["terramind_s1"]["mean"], self.norm_stats["terramind_s1"]["std"], channel_axis=-1)
             tm_s2   = _apply_norm(tm_s2,   self.norm_stats["terramind_s2"]["mean"], self.norm_stats["terramind_s2"]["std"], channel_axis=-1)
 
-        return {"alpha_earth": alpha, "tessera": tessera,
-                "terramind_s1": tm_s1, "terramind_s2": tm_s2, "target": target}
+        out = {"alpha_earth": alpha, "tessera": tessera,
+               "terramind_s1": tm_s1, "terramind_s2": tm_s2, "target": target}
+
+        # THOR streams (optional, Phase 5D): same read/reshape/norm path as
+        # TerraMind. Only loaded for the active thor_s1/thor_s2 streams.
+        for name in self._thor_streams:
+            with rasterio.open(tile[f"{name}_path"]) as src:
+                arr = src.read().astype(np.float32)
+            arr = _sanitize(arr).reshape(768, -1).T            # (256, 768)
+            if self.norm_stats:
+                arr = _apply_norm(arr, self.norm_stats[name]["mean"],
+                                  self.norm_stats[name]["std"], channel_axis=-1)
+            out[name] = arr
+
+        return out
 
     def _init_cache(self, cache_dir, tag, rebuild):
         os.makedirs(cache_dir, exist_ok=True)
         n = len(self.tiles)
         paths = {k: os.path.join(cache_dir, f"{tag}_{k}.f16.npy")
-                 for k in self._CACHE_SPECS}
+                 for k in self._cache_specs}
         done_flag = os.path.join(cache_dir, f"{tag}.done")
 
+        # Rebuild when forced, when the .done flag is absent, or when any required
+        # modality file (incl. active THOR streams) is missing — e.g. a THOR run
+        # pointed at a cache that was built without THOR.
         need_build = rebuild or not os.path.exists(done_flag) or \
             any(not os.path.exists(p) for p in paths.values())
 
@@ -457,13 +509,13 @@ class GeoFMDataset7A(Dataset):
                 os.remove(done_flag)
             mm = {k: np.lib.format.open_memmap(
                       paths[k], mode="w+", dtype=np.float16,
-                      shape=(n, *self._CACHE_SPECS[k]))
-                  for k in self._CACHE_SPECS}
-            gb = sum(np.prod((n, *s)) for s in self._CACHE_SPECS.values()) * 2 / 1e9
+                      shape=(n, *self._cache_specs[k]))
+                  for k in self._cache_specs}
+            gb = sum(np.prod((n, *s)) for s in self._cache_specs.values()) * 2 / 1e9
             print(f"[cache] building {tag}: {n} tiles, ~{gb:.1f} GB f16 -> {cache_dir}")
             for i, tile in enumerate(tqdm(self.tiles, desc=f"cache {tag}", leave=False)):
                 pp = self._preprocess_tile(tile)
-                for k in self._CACHE_SPECS:
+                for k in self._cache_specs:
                     mm[k][i] = pp[k].astype(np.float16)
             for k in mm:
                 mm[k].flush()
@@ -552,10 +604,12 @@ class GeoFMDataset7A(Dataset):
             tm_s1   = np.asarray(cache["terramind_s1"][idx], dtype=np.float32)
             tm_s2   = np.asarray(cache["terramind_s2"][idx], dtype=np.float32)
             target  = np.asarray(cache["target"][idx],       dtype=np.float32)
+            thor = {n: np.asarray(cache[n][idx], dtype=np.float32) for n in self._thor_streams}
         else:
             pp = self._preprocess_tile(tile)
             alpha, tessera = pp["alpha_earth"], pp["tessera"]
             tm_s1, tm_s2, target = pp["terramind_s1"], pp["terramind_s2"], pp["target"]
+            thor = {n: pp[n] for n in self._thor_streams}
 
         if self.is_train:
             emb_dict = {
@@ -564,6 +618,8 @@ class GeoFMDataset7A(Dataset):
                 "terramind_s1": tm_s1,
                 "terramind_s2": tm_s2,
             }
+            for n in self._thor_streams:
+                emb_dict[n] = thor[n]
             emb_dict = augment_domain_shift(emb_dict, self.norm_stats, rng)
 
             k    = int(rng.integers(0, 4))
@@ -572,17 +628,23 @@ class GeoFMDataset7A(Dataset):
             emb_dict["tessera"]      = _d4_transform_pixel(emb_dict["tessera"],      k, flip)
             emb_dict["terramind_s1"] = _d4_transform_patch_grid(emb_dict["terramind_s1"], k, flip)
             emb_dict["terramind_s2"] = _d4_transform_patch_grid(emb_dict["terramind_s2"], k, flip)
+            for n in self._thor_streams:
+                emb_dict[n] = _d4_transform_patch_grid(emb_dict[n], k, flip)
             target = _d4_transform_pixel(target, k, flip)
 
             alpha   = emb_dict["alpha_earth"]
             tessera = emb_dict["tessera"]
             tm_s1   = emb_dict["terramind_s1"]
             tm_s2   = emb_dict["terramind_s2"]
+            thor    = {n: emb_dict[n] for n in self._thor_streams}
 
-        return {
+        out = {
             "alpha_earth":  torch.from_numpy(alpha),
             "tessera":      torch.from_numpy(tessera),
             "terramind_s1": torch.from_numpy(tm_s1),
             "terramind_s2": torch.from_numpy(tm_s2),
             "target":       torch.from_numpy(target),
         }
+        for n in self._thor_streams:
+            out[n] = torch.from_numpy(thor[n])
+        return out

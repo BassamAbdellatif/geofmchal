@@ -139,7 +139,13 @@ def parse_args():
     parser.add_argument("--use-stratified-sampler", action=argparse.BooleanOptionalAction, default=True, help="[7A] Use WeightedRandomSampler over coverage strata (default True).")
     parser.add_argument("--use-gradnorm", action=argparse.BooleanOptionalAction, default=True, help="[7A] Learn task loss weights with GradNorm (default True). Used in Phase 3.")
     parser.add_argument("--static-weights", type=str, default="0.65,0.64,1.70", help="[7A Phase 5C] Static task weights 'w_f,w_h,w_b' used when --no-use-gradnorm. Default = GradNorm-converged values from 7A_base_e90 ep59.")
-    parser.add_argument("--use-thor", action=argparse.BooleanOptionalAction, default=False, help="[7A] Include THOR embeddings (default False; Phase 5 ablation).")
+    parser.add_argument("--use-thor", action=argparse.BooleanOptionalAction, default=False, help="[7A] Include THOR embeddings (default False; Phase 5 ablation). [Phase 5D] Inferred automatically from --patch-inputs; kept for back-compat.)")
+    parser.add_argument("--patch-stem-version", type=str, default="v2", choices=["v1", "v2"],
+                        help="[7A Phase 5D] Patch token stem: v1 = original (7A_simple); "
+                             "v2 = enhanced per-modality LayerNorm + 2-layer MLP. Default v2.")
+    parser.add_argument("--xattn-heads", type=int, default=4,
+                        help="[7A Phase 5D] Cross-attention heads at patch-token injection. "
+                             "Default 4. Reduce to 2 if THOR (2x K/V tokens) OOMs.")
     parser.add_argument("--max-batches", type=int, default=0, help="If >0, cap batches per epoch (smoke testing).")
     parser.add_argument("--veg-height-boost", type=float, default=0.0,
                         help="[7A P5.1] Extra weight on masked Huber for vegetation pixels "
@@ -571,6 +577,23 @@ def train_7a(args):
     np.random.seed(args.seed)
     random.seed(args.seed)
 
+    # Resolve patch-input names (terramind_s1/s2, thor_s1/s2). 'all' expands to
+    # the full PATCH_DIR_MAP. THOR usage is inferred from the resolved names.
+    _patch_str = args.patch_inputs.strip().lower()
+    if _patch_str == "all":
+        patch_names = list(PATCH_DIR_MAP.keys())
+    else:
+        patch_names = [p.strip() for p in _patch_str.split(",") if p.strip()]
+    for p in patch_names:
+        if p not in PATCH_DIR_MAP:
+            raise ValueError(f"Unknown patch input '{p}'. Valid: {list(PATCH_DIR_MAP)}")
+    if not any(p.endswith("_s1") for p in patch_names) and \
+       not any(p.endswith("_s2") for p in patch_names):
+        raise ValueError(f"--patch-inputs must include at least one *_s1 or *_s2 stream; got {patch_names}")
+    use_thor = any(p.startswith("thor") for p in patch_names)
+    print(f"   >> patch inputs: {patch_names}  (use_thor={use_thor}, "
+          f"stem={args.patch_stem_version}, xattn_heads={args.xattn_heads})")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     runs_dir = _runs_dir_7a()
     exp_dir = os.path.join(runs_dir, args.experiment_name)
@@ -591,7 +614,10 @@ def train_7a(args):
         f.write(f"CACHE_DIR: {args.cache_dir}\n")
         f.write(f"USE_STRATIFIED_SAMPLER: {args.use_stratified_sampler}\n")
         f.write(f"USE_GRADNORM: {args.use_gradnorm}\n")
-        f.write(f"USE_THOR: {args.use_thor}\n")
+        f.write(f"USE_THOR: {use_thor}\n")
+        f.write(f"PATCH_INPUTS: {','.join(patch_names)}\n")
+        f.write(f"PATCH_STEM_VERSION: {args.patch_stem_version}\n")
+        f.write(f"XATTN_HEADS: {args.xattn_heads}\n")
         f.write(f"STATIC_WEIGHTS: {args.static_weights}\n")
         f.write(f"NO_HEIGHT_BRIDGE: {args.no_height_bridge}\n")
         f.write(f"NO_BINARY_HEAD: {args.no_binary_head}\n")
@@ -599,11 +625,13 @@ def train_7a(args):
         f.write(f"OPTIMIZER: AdamW lr={LEARNING_RATE} wd={WEIGHT_DECAY}\n")
 
     print("--- 7A Data Setup ---")
-    tiles = find_multimodal_train_tiles(DATA_ROOT_7A)
+    tiles = find_multimodal_train_tiles(DATA_ROOT_7A, use_thor=use_thor)
     train_ds = GeoFMDataset7A(tiles, is_train=True, cv_fold=args.cv_fold,
-                              cache_dir=args.cache_dir, rebuild_cache=args.rebuild_cache)
+                              cache_dir=args.cache_dir, rebuild_cache=args.rebuild_cache,
+                              patch_inputs=patch_names)
     val_ds = GeoFMDataset7A(tiles, is_train=False, cv_fold=args.cv_fold,
-                            cache_dir=args.cache_dir, rebuild_cache=args.rebuild_cache)
+                            cache_dir=args.cache_dir, rebuild_cache=args.rebuild_cache,
+                            patch_inputs=patch_names)
     print(f"   >> matched={len(tiles)}  train={len(train_ds)}  val={len(val_ds)}  (cv_fold={args.cv_fold})")
 
     if args.use_stratified_sampler:
@@ -626,7 +654,10 @@ def train_7a(args):
 
     print("--- 7A Model Init ---")
     model, _ = build_model("dual_enc_dec_fusion", n_channels=64, n_classes=4,
-                           use_height_bridge=not args.no_height_bridge)
+                           use_height_bridge=not args.no_height_bridge,
+                           patch_inputs=patch_names,
+                           patch_stem_version=args.patch_stem_version,
+                           xattn_heads=args.xattn_heads)
     model = model.to(device)
     print(f"   >> params: {sum(p.numel() for p in model.parameters())/1e6:.2f}M"
           f"  (height_bridge={'off' if args.no_height_bridge else 'on'})")
