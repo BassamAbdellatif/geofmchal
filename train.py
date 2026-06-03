@@ -146,6 +146,16 @@ def parse_args():
     parser.add_argument("--xattn-heads", type=int, default=4,
                         help="[7A Phase 5D] Cross-attention heads at patch-token injection. "
                              "Default 4. Reduce to 2 if THOR (2x K/V tokens) OOMs.")
+    parser.add_argument("--patch-routing", type=str, default="sensor",
+                        choices=["sensor", "s1-both", "all-both"],
+                        help="[7A Phase 5E #4] Sensor->branch routing. 'sensor' (default) = "
+                             "s1->height, s2->fraction (byte-identical). 's1-both' also feeds "
+                             "S1 (SAR) into the fraction branch (water/building). 'all-both' = both.")
+    parser.add_argument("--use-fraction-bridge", action=argparse.BooleanOptionalAction, default=False,
+                        help="[7A Phase 5E #1] Add a tessera-bottleneck -> fraction-decoder bridge "
+                             "(GradScale-protected), mirror of the height bridge. Default off.")
+    parser.add_argument("--fraction-bridge-alpha", type=float, default=0.2,
+                        help="[7A Phase 5E #1] GradScale alpha for the fraction bridge. Default 0.2.")
     parser.add_argument("--max-batches", type=int, default=0, help="If >0, cap batches per epoch (smoke testing).")
     parser.add_argument("--veg-height-boost", type=float, default=0.0,
                         help="[7A P5.1] Extra weight on masked Huber for vegetation pixels "
@@ -618,6 +628,9 @@ def train_7a(args):
         f.write(f"PATCH_INPUTS: {','.join(patch_names)}\n")
         f.write(f"PATCH_STEM_VERSION: {args.patch_stem_version}\n")
         f.write(f"XATTN_HEADS: {args.xattn_heads}\n")
+        f.write(f"PATCH_ROUTING: {args.patch_routing}\n")
+        f.write(f"USE_FRACTION_BRIDGE: {args.use_fraction_bridge}\n")
+        f.write(f"FRACTION_BRIDGE_ALPHA: {args.fraction_bridge_alpha}\n")
         f.write(f"STATIC_WEIGHTS: {args.static_weights}\n")
         f.write(f"NO_HEIGHT_BRIDGE: {args.no_height_bridge}\n")
         f.write(f"NO_BINARY_HEAD: {args.no_binary_head}\n")
@@ -657,7 +670,10 @@ def train_7a(args):
                            use_height_bridge=not args.no_height_bridge,
                            patch_inputs=patch_names,
                            patch_stem_version=args.patch_stem_version,
-                           xattn_heads=args.xattn_heads)
+                           xattn_heads=args.xattn_heads,
+                           patch_routing=args.patch_routing,
+                           use_fraction_bridge=args.use_fraction_bridge,
+                           fraction_bridge_alpha=args.fraction_bridge_alpha)
     model = model.to(device)
     print(f"   >> params: {sum(p.numel() for p in model.parameters())/1e6:.2f}M"
           f"  (height_bridge={'off' if args.no_height_bridge else 'on'})")

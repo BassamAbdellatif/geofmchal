@@ -12,6 +12,11 @@ modify existing classes destructively).
 
 Priority order (highest expected payoff first): **#4 → #1 → #3 → #2**.
 
+> **Status update (2026-06-03):** #4 (`--patch-routing`) and #1 (`--use-fraction-bridge`)
+> are **implemented** (additive, default-off, byte-identical when off — verified max_abs_diff=0)
+> and smoke-tested (full-THOR `s1-both`+fbridge at bs24 → finite loss, peak 33.8 GB/48). They are
+> runnable now. #3 and #2 remain unimplemented (backlog).
+
 ---
 
 ## #4 — Route S1 (SAR) into the fraction branch  ⟵ highest priority
