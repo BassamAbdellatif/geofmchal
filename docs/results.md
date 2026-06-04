@@ -407,3 +407,54 @@ spend a 12h submission slot on it.
 | Structurally attack RMSE_V (vegboost dead): why does the height decoder plateau at 4.0m? | RMSE_V is the only thing keeping 7A below 2A | 📋 research |
 | Confirm `no_bridge` IoU_W collapse with a seed re-run before removing the bridge | rule out artifact | 📋 |
 | ~~7A_vegboost retrain (was 🔥 highest priority)~~ | **DONE — vegboost confirmed ineffective (findings 17)** | ✅ closed (negative) |
+
+---
+
+## 7A Phase 5D — THOR Integration + Enhanced Patch Stems (2026-06-04) — NEGATIVE
+
+Full detail and diagnostic trail: `docs/phase5d_thor.md`. Branch `exp-7-clean-slate`.
+All metrics: geo-CV fold 0, hard-IoU@0.5, **raw prediction (no threshold/blend)**, 60 epochs,
+static weights `[0.65,0.64,1.70]`, no GradNorm, no vegboost, **batch 32**.
+
+### Final campaign (v1 stem, water-safe)
+| Experiment | Patch inputs | Stem | Proxy | IoU_B | IoU_V | IoU_W | RMSE_B | RMSE_V |
+|------------|--------------|------|-------|-------|-------|-------|--------|--------|
+| `7A_v1_base` (reference repro) | terramind_s1,s2 | v1 | **0.400** | 0.196 | 0.811 | 0.684 | 2.07m | 4.03m |
+| `7A_v1_thor` (full THOR) | +thor_s1,thor_s2 | v1 | 0.294 | 0.189 | 0.808 | **0.000** | 2.07m | 3.98m |
+| `7A_v1_thor_s1` | +thor_s1 | v1 | 0.397 | 0.191 | 0.811 | 0.688 | 2.05m | 4.00m |
+| `7A_v1_thor_s2` | +thor_s2 | v1 | 0.395 | 0.192 | 0.807 | 0.687 | 2.06m | 4.00m |
+
+(An earlier v2-stem @ batch-24 campaign was discarded — water bug, finding 23/24.)
+
+### 22. THOR adds no value to 7A
+Single-stream THOR (s1 *or* s2) ties the base proxy (~0.40) with **no IoU_B gain**; full THOR
+(both streams) collapses water (IoU_W 0.68→0.00). THOR rejected — consistent with the 2A-era
+finding that it was redundant; the per-modality-calibration hypothesis did not rescue it (f23).
+
+### 23. The enhanced patch stem (v2/v2b) suppresses rare-class ignition
+The Phase-5D "enhanced" stem (`PatchTokenStemV2`: input-LayerNorm + 2-layer MLP) zeroed IoU_W
+even terramind-only. Isolation proved it is **not** the input LayerNorm — the `v2b` variant
+(LayerNorm removed, output-norm instead) still collapses water. It is the **deeper 2-layer stem
+itself**; the simple **v1** single-linear stem is required. v2 and v2b rejected.
+
+### 24. Rare-class (water) ignition needs batch ≥ 32 and a simple stem
+Water IoU ignites sharply (~0→0.5 by epoch 2) only under a narrow regime: **v1 stem + batch 32 +
+≤3 patch streams**. Batch 24, the v2/v2b stem, or full-THOR each *independently* prevent ignition
+— water stays exactly 0.000 for all 60 epochs, at every threshold down to 0.05 (so not a
+calibration artifact; cache verified byte-identical, ruling out data). Building survives these
+perturbations because of its dedicated binary head (weight 1.70); water has none and dies first.
+Extends finding 16. Root cause = weak rare-class supervision → the productive lever is a dedicated
+**water head / aggressive rare-class sampling**, not patch-token engineering.
+
+### 25. Augmentation RNG is unseeded (reproducibility gap)
+`GeoFMDataset7A.__getitem__` uses `np.random.default_rng()` (no seed), so augmentation differs
+every run regardless of `--seed`. Fine ablations (±0.01 IoU) are noise-limited until seeded.
+
+### Phase 5D verdict & forward plan
+- **Best 7A model = `7A_v1_base` = the reference** (proxy ~0.40, IoU_B 0.20). Phase 5D produced no gain.
+- THOR, enhanced stems: **closed-negative.**
+- Inference threshold calibration / blend-binary **not pursued** — fit to fold-0 val, won't
+  transfer to the different-region/year test set (generalization risk). Rely on raw 0.5 prediction.
+- New line **`exp-8-decouple`** (targets IoU_B): seed augmentation; single-task ablations
+  (is multi-task interference real?); aggressive rare-class oversampling; symmetric cross-encoder
+  gradients (tessera→fraction bridge, GradScale sweep); SAR-safe (no-rotation) augmentation.
