@@ -50,7 +50,7 @@ score = 0.25×IoU_B + 0.15×IoU_V + 0.15×IoU_W
 - Cross-attention with shared decoder produced proxy 0.24 vs 2A's 0.37
 - See `results.md` § 6A and prompts/exp-6-tessera-xattn.md for full analysis
 
-### Planned: 7A — decoupled dual-encoder / dual-decoder (`exp-7-clean-slate`)
+### 7A — decoupled dual-encoder / dual-decoder (`exp-7-clean-slate`) — current 7A best: `7A_v1_base` (proxy ~0.40)
 - Two modality-specialised encoders (AlphaEarth → urban-spatial, TESSERA → temporal-natural)
 - Two task-specialised decoders (fractions, height)
 - Patch tokens routed by sensor type: S1 → height decoder, S2 → fraction decoder
@@ -58,6 +58,8 @@ score = 0.25×IoU_B + 0.15×IoU_V + 0.15×IoU_W
 - Geographic CV, stratified sampling, channel standardisation, auxiliary binary B head
 - GradNorm task balancing; D4 TTA and threshold calibration at inference
 - See `prompts/exp-7-clean-slate.md` for full spec
+
+**Outcome (Phase 5B–5D, 2026-06-04):** recommended recipe = **`7A_v1_base`** — v1 patch stem, static weights `[0.65,0.64,1.70]`, no GradNorm, no vegboost, batch 32, bridge on, binary head on; internal proxy **~0.40** (IoU_B 0.20 / IoU_V 0.81 / IoU_W 0.68 / RMSE_V 4.0). **Rejected:** GradNorm≈static (f18), vegboost (f17), THOR (f22), enhanced v2/v2b stems (f23). **Not used going forward:** inference threshold calibration / blend-binary (fit to fold-0 val → won't transfer to the shifted test set; depend on the raw 0.5 prediction). RMSE_V 4.0m cliff (f21) is the binding constraint. Full detail: `docs/phase5d_thor.md`. Next line: `exp-8-decouple`.
 
 ## Key Files
 | File | Role |
@@ -112,3 +114,7 @@ cd /mnt/head/users/bassam/src/geofmchal
 - **Shared decoders force destructive task competition** (6A finding). The 2A two-decoder Y-Net split was doing more work than credited; collapsing to a shared decoder cost ~0.13 in proxy.
 - **GradScale α=0.1** on the height decoder helps but is not sufficient on its own to prevent task interference.
 - **Random validation splits leak spatial context.** 7A switches to geographic CV (KMeans over lat/lon) because the test set is in different regions and years.
+- **THOR adds nothing to 7A** (Phase 5D, f22): single-stream ties the base, full-stream collapses water. Dropped.
+- **Rare-class (water) ignition is fragile** (f23–24): it needs the simple **v1** patch stem + **batch ≥ 32** + ≤3 patch streams. The deeper v2/v2b stem, batch 24, or full-THOR each independently zero IoU_W for all 60 epochs (dead at every threshold down to 0.05 — not a calibration artifact). Building survives via its dedicated binary head; water has none → root cause is weak rare-class supervision.
+- **Augmentation RNG is unseeded** (f25): `np.random.default_rng()` in the dataset ignores `--seed`; seed it before trusting fine ablations.
+- **Don't tune inference thresholds / blend-binary to fold-0 val** — fit to that fold's distribution, won't transfer to the different-region/year test set. Depend on the raw prediction at 0.5.
