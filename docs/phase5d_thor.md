@@ -266,8 +266,71 @@ platform without explicit approval.
 
 ---
 
-## 9. Not done (awaiting go-ahead)
-- No training launched.
-- Spec not renamed/committed (`prompts/Exp 7 phase5d thor·MD` → `prompts/exp-7-phase5d-thor.md`);
-  nothing committed; `results.md` / `science.md` untouched.
-- Artifacts in tree: `_thor_smoke/` (verification scripts incl. `ref.pt`), `data/norm_stats.json.bak`.
+## 9. Pre-launch state (superseded by §10)
+- (At smoke-checkpoint time) no training launched; spec renamed/committed since; `results.md`/`science.md` left untouched.
+
+---
+
+## 10. Results & verdict (2026-06-04) — **Phase 5D falsified**
+
+All metrics below are fold-0 validation, hard-IoU@0.5, computed by the same evaluator
+(`_thor_smoke/eval_runs.py`); 60-epoch runs unless noted.
+
+### Final campaign (water-safe v1 stem @ batch 32)
+| Run | stem | bs | proxy | IoU_B | IoU_V | IoU_W | RMSE_B | RMSE_V |
+|-----|------|----|-------|-------|-------|-------|--------|--------|
+| 7A_simple (ref) | v1 | 32 | 0.399 | 0.215 | 0.810 | 0.684 | 2.06 | 4.21 |
+| 7A_v1_base | v1 | 32 | **0.400** | 0.196 | 0.811 | 0.684 | 2.07 | 4.03 |
+| 7A_v1_thor (full) | v1 | 32 | 0.294 | 0.189 | 0.808 | **0.000** | 2.07 | 3.98 |
+| 7A_v1_thor_s1 | v1 | 32 | 0.397 | 0.191 | 0.811 | 0.688 | 2.05 | 4.00 |
+| 7A_v1_thor_s2 | v1 | 32 | 0.395 | 0.192 | 0.807 | 0.687 | 2.06 | 4.00 |
+
+The earlier v2-stem @ bs24 campaign (`7A_simple_v2stem/thor/thor_s1`) is **invalid** — all hit
+IoU_W=0.000 (the water bug below) and were discarded.
+
+### The water-ignition bug (diagnostic trail)
+- Initial runs showed **IoU_W = 0.000 for all 60 epochs** while building/veg were healthy.
+- **Threshold sweep**: water IoU is 0 at every threshold down to 0.05 → the channel is collapsed
+  to ≈0 everywhere, *not* a sub-0.5 thresholding artifact (calibration cannot recover it).
+- **Reference re-eval**: the `7A_simple` checkpoint genuinely has IoU_W 0.684 and *ignites at
+  epoch 2* (0.007→0.498). So water is learnable on this fold; we regressed it.
+- **Cache exonerated**: old (pre-THOR) vs new (THOR-rebuilt) cache are **byte-identical** —
+  `target`/`terramind_s2`/`tessera`/`alpha_earth` max_abs_diff=0, water-positive pixels equal.
+- **Isolation (5-epoch diagnostics)**: v1@bs32 ignites (control reproduces ref, IoU_W→0.665);
+  v1@bs24 dead; v2@bs32 dead; v2b@bs32 (terramind-only) dead; v1+full-THOR dead;
+  v2b+full-THOR kills **building too** (IoU_B=0).
+
+### Findings
+1. **Rare-class (water) ignition is fragile** and independently suppressed by: batch < 32, the
+   enhanced stem (v2 **and** v2b), and stacking both THOR streams. The simple v1 stem + ≤3 patch
+   streams + bs32 is the only stable regime.
+2. **The v2 input-LayerNorm was *not* the cause.** v2b removed it and water still collapsed →
+   the culprit is the deeper 2-layer stem itself, not where the norm sits. v1's single-linear
+   stem is required.
+3. **THOR adds no value.** Single-stream THOR ties the base (no IoU_B gain — the target metric);
+   full THOR breaks water. So both Phase 5D changes (enhanced stem, THOR) are rejected.
+4. **Building survives because it has a dedicated head** (binary head, weight 1.70); water has
+   none, so it's the first to die under any perturbation (and building finally dies too under the
+   worst config, v2b+full-THOR).
+
+### Verdict
+- **Best model = `7A_v1_base` = the reference (proxy ~0.40).** Phase 5D produced no gain.
+- Enhanced stem (v2/v2b): **rejected.** THOR: **rejected.**
+- Root cause of the proxy gap to the top team is **weak rare-class supervision** (water has no
+  dedicated head), not patch-token representation. Next direction: a dedicated **water head** /
+  water loss up-weighting on the v1 base — independent of THOR.
+
+### Reproducibility note (separate issue, worth fixing)
+Augmentation RNG is **unseeded** — `np.random.default_rng()` in `GeoFMDataset7A.__getitem__`
+ignores `--seed`, so every run varies. The patterns above held consistently across many runs, but
+seeding augmentation is recommended before fine comparisons.
+
+### Lessons (candidates for the results.md running list)
+- Rare classes without a dedicated head **fail to ignite below batch 32**.
+- **Deeper patch-token stems destabilize rare-class ignition** — keep the v1 single-linear stem.
+- **THOR (second S1/S2 FM) does not improve 7A** — neutral single-stream, harmful full.
+
+### Artifacts
+- v2b stem (`PatchTokenStemV2b`, `--patch-stem-version v2b`) committed for the record (additive,
+  default-off, byte-identical when unused) — kept as a documented negative result.
+- `_thor_smoke/` holds the verification + eval scripts (`verify.py`, `eval_runs.py`, `ref.pt`).

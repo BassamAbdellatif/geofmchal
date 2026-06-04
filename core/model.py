@@ -549,12 +549,43 @@ class PatchTokenStemV2(nn.Module):
         return x + self.pos_embed
 
 
+class PatchTokenStemV2b(nn.Module):
+    """
+    Phase 5E water-safe variant of the enhanced stem.
+
+    Keeps V2's depth/calibration intent (2-layer GELU MLP + learned positional
+    encoding) but DROPS the input LayerNorm. V2's LayerNorm over the raw 768-d
+    tokens normalises away per-token magnitude, which empirically suppressed
+    rare-class (water) ignition: v1/v2b keep water (IoU_W ~0.68), v2 collapses it
+    to 0. V2b normalises the OUTPUT instead (v1-style), so the input token scale
+    the water signal lives in is preserved. Cross-modal scale (THOR ≫ TerraMind)
+    is already handled upstream by the per-channel cache norm-stats, so the input
+    LayerNorm was both redundant and harmful.
+    """
+
+    def __init__(self, in_dim: int = 768, out_dim: int = 384):
+        super().__init__()
+        self.proj1  = nn.Linear(in_dim, out_dim)
+        self.act    = nn.GELU()
+        self.proj2  = nn.Linear(out_dim, out_dim)
+        self.norm   = nn.LayerNorm(out_dim)          # output norm (v1-style)
+        self.pos_embed = nn.Parameter(torch.randn(256, out_dim) * 0.02)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.act(self.proj1(x))
+        x = self.proj2(x)
+        x = self.norm(x)
+        return x + self.pos_embed
+
+
 def _make_patch_stem(version, in_dim=768, out_dim=384):
     if version == "v1":
         return PatchTokenStemV1(in_dim, out_dim)
     if version == "v2":
         return PatchTokenStemV2(in_dim, out_dim)
-    raise ValueError(f"Unknown patch_stem_version {version!r}; use 'v1' or 'v2'.")
+    if version == "v2b":
+        return PatchTokenStemV2b(in_dim, out_dim)
+    raise ValueError(f"Unknown patch_stem_version {version!r}; use 'v1', 'v2', or 'v2b'.")
 
 
 class PatchCrossAttnBlock(nn.Module):
