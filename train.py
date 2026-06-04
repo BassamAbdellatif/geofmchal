@@ -140,9 +140,11 @@ def parse_args():
     parser.add_argument("--use-gradnorm", action=argparse.BooleanOptionalAction, default=True, help="[7A] Learn task loss weights with GradNorm (default True). Used in Phase 3.")
     parser.add_argument("--static-weights", type=str, default="0.65,0.64,1.70", help="[7A Phase 5C] Static task weights 'w_f,w_h,w_b' used when --no-use-gradnorm. Default = GradNorm-converged values from 7A_base_e90 ep59.")
     parser.add_argument("--use-thor", action=argparse.BooleanOptionalAction, default=False, help="[7A] Include THOR embeddings (default False; Phase 5 ablation). [Phase 5D] Inferred automatically from --patch-inputs; kept for back-compat.)")
-    parser.add_argument("--patch-stem-version", type=str, default="v2", choices=["v1", "v2"],
-                        help="[7A Phase 5D] Patch token stem: v1 = original (7A_simple); "
-                             "v2 = enhanced per-modality LayerNorm + 2-layer MLP. Default v2.")
+    parser.add_argument("--patch-stem-version", type=str, default="v2", choices=["v1", "v2", "v2b"],
+                        help="[7A Phase 5D/5E] Patch token stem: v1 = original (7A_simple); "
+                             "v2 = enhanced input-LayerNorm + 2-layer MLP (NOTE: input LayerNorm "
+                             "collapses water IoU); v2b = 2-layer MLP + output norm, no input "
+                             "LayerNorm (water-safe). Default v2.")
     parser.add_argument("--xattn-heads", type=int, default=4,
                         help="[7A Phase 5D] Cross-attention heads at patch-token injection. "
                              "Default 4. Reduce to 2 if THOR (2x K/V tokens) OOMs.")
