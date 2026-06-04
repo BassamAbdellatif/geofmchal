@@ -158,6 +158,14 @@ def parse_args():
                              "(GradScale-protected), mirror of the height bridge. Default off.")
     parser.add_argument("--fraction-bridge-alpha", type=float, default=0.2,
                         help="[7A Phase 5E #1] GradScale alpha for the fraction bridge. Default 0.2.")
+    parser.add_argument("--task", type=str, default="all", choices=["all", "fraction", "height"],
+                        help="[7A Phase 8 P4] Train all tasks (default), or a single task: "
+                             "'fraction' = fraction+binary only (drops height loss); "
+                             "'height' = height only. Single-task diagnostic for multi-task interference.")
+    parser.add_argument("--strata-weights", type=str, default="1.0,1.5,2.0,3.0",
+                        help="[7A Phase 8 P3a] WeightedRandomSampler weights for the 4 coverage "
+                             "strata (empty,sparse,medium,dense). Default '1.0,1.5,2.0,3.0'. Try "
+                             "'1,2,4,8' for more aggressive rare-class (building/water) oversampling.")
     parser.add_argument("--max-batches", type=int, default=0, help="If >0, cap batches per epoch (smoke testing).")
     parser.add_argument("--veg-height-boost", type=float, default=0.0,
                         help="[7A P5.1] Extra weight on masked Huber for vegetation pixels "
@@ -636,6 +644,8 @@ def train_7a(args):
         f.write(f"STATIC_WEIGHTS: {args.static_weights}\n")
         f.write(f"NO_HEIGHT_BRIDGE: {args.no_height_bridge}\n")
         f.write(f"NO_BINARY_HEAD: {args.no_binary_head}\n")
+        f.write(f"TASK: {args.task}\n")
+        f.write(f"STRATA_WEIGHTS: {args.strata_weights}\n")
         f.write(f"SEED: {args.seed}\n")
         f.write(f"OPTIMIZER: AdamW lr={LEARNING_RATE} wd={WEIGHT_DECAY}\n")
 
@@ -650,7 +660,8 @@ def train_7a(args):
     print(f"   >> matched={len(tiles)}  train={len(train_ds)}  val={len(val_ds)}  (cv_fold={args.cv_fold})")
 
     if args.use_stratified_sampler:
-        weights = train_ds.sampler_weights()
+        _strata = [float(x) for x in args.strata_weights.split(",")]
+        weights = train_ds.sampler_weights(weights=_strata)
         sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
         shuffle = False
     else:
@@ -689,6 +700,12 @@ def train_7a(args):
     # static weighting never sees a constant-zero loss (which would NaN GradNorm).
     task_names = ["fraction", "height"] if args.no_binary_head \
         else ["fraction", "height", "binary"]
+    # [Phase 8 P4] Single-task diagnostic: keep only the active task's losses.
+    if args.task == "fraction":
+        task_names = [t for t in task_names if t in ("fraction", "binary")]
+    elif args.task == "height":
+        task_names = ["height"]
+    print(f"   >> task={args.task}  active losses: {task_names}")
     use_gn = args.use_gradnorm
     if use_gn:
         balancer = GradNormBalancer(task_names, device, alpha=1.5, lr=0.025)

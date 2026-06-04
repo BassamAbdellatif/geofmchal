@@ -564,13 +564,18 @@ class GeoFMDataset7A(Dataset):
             scores.append(build + water)
         return scores
 
-    def sampler_weights(self):
+    def sampler_weights(self, weights=None):
         """
         Per-sample weights for WeightedRandomSampler.
         Strata cut at quartiles of the continuous coverage distribution so
         each of the 4 strata holds a real population (~equal counts), then
-        weighted [1.0, 1.5, 2.0, 3.0] from low to high coverage.
+        weighted (default [1.0, 1.5, 2.0, 3.0]) from low to high coverage.
+        `weights` (4 floats) overrides the defaults for more aggressive
+        rare-class oversampling (Phase 8 P3a).
         """
+        w = list(weights) if weights is not None else _STRATA_WEIGHTS
+        if len(w) != 4:
+            raise ValueError(f"sampler weights must have 4 entries, got {w}")
         scores = np.asarray(self._coverage_scores, dtype=np.float64)
         # Stratum 0 = zero coverage. The positive part is split into 3 tertiles
         # (strata 1,2,3) so all four strata hold a real, roughly-equal population.
@@ -586,14 +591,19 @@ class GeoFMDataset7A(Dataset):
             return int(1 + np.searchsorted(q, s, side="right"))  # -> 1, 2, or 3
 
         self._stratum_edges = [0.0] + q.tolist()
-        return [_STRATA_WEIGHTS[_stratum(s)] for s in scores]
+        return [w[_stratum(s)] for s in scores]
 
     def __len__(self):
         return len(self.tiles)
 
     def __getitem__(self, idx):
         tile = self.tiles[idx]
-        rng = np.random.default_rng()
+        # Reproducible augmentation: seed the per-sample RNG from the (per-worker,
+        # per-epoch) torch seed + sample index. A fixed --seed now gives identical
+        # runs, while augmentation still varies across epochs (DataLoader advances
+        # the worker seed each epoch). Previously np.random.default_rng() drew from
+        # OS entropy and ignored --seed (Phase 5D finding 25).
+        rng = np.random.default_rng((int(torch.initial_seed()) + idx) % (2 ** 63))
 
         cache = self._ensure_cache()
         if cache is not None:
