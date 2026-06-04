@@ -3,6 +3,7 @@ import os
 import random
 import time
 import argparse
+from contextlib import nullcontext
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
@@ -166,6 +167,10 @@ def parse_args():
                         help="[7A Phase 8 P3a] WeightedRandomSampler weights for the 4 coverage "
                              "strata (empty,sparse,medium,dense). Default '1.0,1.5,2.0,3.0'. Try "
                              "'1,2,4,8' for more aggressive rare-class (building/water) oversampling.")
+    parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=False,
+                        help="[7A Phase 8] bf16 mixed precision (autocast) for train+eval forward. "
+                             "~halves activation memory (bs32 ~42GB -> ~24GB) so the 7A model fits "
+                             "with headroom on a 48GB GPU. Default off (fp32, byte-identical).")
     parser.add_argument("--max-batches", type=int, default=0, help="If >0, cap batches per epoch (smoke testing).")
     parser.add_argument("--veg-height-boost", type=float, default=0.0,
                         help="[7A P5.1] Extra weight on masked Huber for vegetation pixels "
@@ -543,7 +548,7 @@ def _runs_dir_7a():
 
 
 @torch.no_grad()
-def evaluate_7a(model, val_loader, criterion, device, C=4.0):
+def evaluate_7a(model, val_loader, criterion, device, C=4.0, amp=False):
     """Hard-IoU@0.5 (B/V/W), masked RMSE in metres (B/V), proxy (C=4.0), val losses."""
     model.eval()
     inter = torch.zeros(3, device=device)
@@ -553,11 +558,15 @@ def evaluate_7a(model, val_loader, criterion, device, C=4.0):
     task_sums = {"fraction": 0.0, "height": 0.0, "binary": 0.0}
     nb = 0
 
+    ev_ctx = (lambda: torch.autocast(device_type="cuda", dtype=torch.bfloat16)) \
+        if (amp and device.type == "cuda") else nullcontext
     for batch in val_loader:
         batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
         target = batch["target"]
-        out = model(batch)
-        losses = criterion(out, target)
+        with ev_ctx():
+            out = model(batch)
+            losses = criterion(out, target)
+        out = {k: v.float() for k, v in out.items()}   # fp32 for metric math
         for k in task_sums:
             task_sums[k] += float(losses[k].detach())
         nb += 1
@@ -615,6 +624,12 @@ def train_7a(args):
           f"stem={args.patch_stem_version}, xattn_heads={args.xattn_heads})")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # bf16 autocast context (Phase 8 --amp): halves activation memory so bs32 fits
+    # with headroom. No GradScaler needed for bf16. nullcontext when off (fp32).
+    amp_ctx = (lambda: torch.autocast(device_type="cuda", dtype=torch.bfloat16)) \
+        if (args.amp and device.type == "cuda") else nullcontext
+    if args.amp:
+        print("   >> AMP on (bf16 autocast, train+eval forward)")
     runs_dir = _runs_dir_7a()
     exp_dir = os.path.join(runs_dir, args.experiment_name)
     os.makedirs(exp_dir, exist_ok=True)
@@ -646,6 +661,7 @@ def train_7a(args):
         f.write(f"NO_BINARY_HEAD: {args.no_binary_head}\n")
         f.write(f"TASK: {args.task}\n")
         f.write(f"STRATA_WEIGHTS: {args.strata_weights}\n")
+        f.write(f"AMP: {args.amp}\n")
         f.write(f"SEED: {args.seed}\n")
         f.write(f"OPTIMIZER: AdamW lr={LEARNING_RATE} wd={WEIGHT_DECAY}\n")
 
@@ -738,15 +754,16 @@ def train_7a(args):
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
             target = batch["target"]
             optimizer.zero_grad()
-            out = model(batch)
-            per_task = criterion(out, target)
+            with amp_ctx():
+                out = model(batch)
+                per_task = criterion(out, target)
 
-            if use_gn:
-                balancer.step(per_task, ref_params)        # before model backward
-                w = balancer.weights()
-                loss = sum(w[i] * per_task[n] for i, n in enumerate(task_names))
-            else:
-                loss = sum(static_w[n] * per_task[n] for n in task_names)
+                if use_gn:
+                    balancer.step(per_task, ref_params)    # before model backward
+                    w = balancer.weights()
+                    loss = sum(w[i] * per_task[n] for i, n in enumerate(task_names))
+                else:
+                    loss = sum(static_w[n] * per_task[n] for n in task_names)
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -763,7 +780,7 @@ def train_7a(args):
         train_hist.append(epoch_loss)
         ep_task = {k: v / max(1, seen) for k, v in ep_task.items()}
 
-        metrics = evaluate_7a(model, val_loader, criterion, device)
+        metrics = evaluate_7a(model, val_loader, criterion, device, amp=args.amp)
         proxy_hist.append(metrics["proxy"])
 
         if metrics["proxy"] > best_proxy:
