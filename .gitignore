@@ -8,3 +8,6 @@ runs
 uploader/cookies.json
 *.png
 nohup.out
+_thor_smoke/*.pt
+_thor_smoke/ref.pt
+data/*.bak
