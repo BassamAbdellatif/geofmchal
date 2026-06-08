@@ -2,15 +2,25 @@
 
 ## Platform Submissions (Ground Truth)
 
-| # | Experiment | Platform Score | IoU_B | IoU_V | IoU_W | RMSE_B | RMSE_V | Notes |
-|---|-----------|---------------|-------|-------|-------|--------|--------|-------|
-| 1 | `2A_alpha_ts1_ts2_nologits` | 0.366039 | 0.3394 | 0.7649 | 0.3695 | 2.27m | 3.74m | Best before vegboost |
-| 2 | `2A_vegboost` | 0.372136 | 0.3394 | 0.7649 | 0.3695 | 2.27m | 3.74m | **current best** |
-| 3 | `7A_geocv_baseline` (TTA+blend+thresh) | 0.357527 | 0.3403 | 0.7981 | 0.4138 | 2.35m | 4.09m | RMSE_V above cliff → score regression |
+| Date | Experiment | Platform Score | IoU_B | IoU_V | IoU_W | RMSE_B | RMSE_V | Inference | Notes |
+|------|-----------|---------------|-------|-------|-------|--------|--------|-----------|-------|
+| 5/23 | `2A_alpha_ts1_ts2_nologits` | 0.3660 | 0.3394 | 0.7649 | 0.3695 | 2.274 | 3.736 | raw | best before vegboost; under cliff |
+| 5/25 | `4A_hook` | 0.3647 | 0.3420 | 0.7896 | 0.4126 | 2.394 | 3.789 | raw | Y-Net+GradScale; under cliff; best transfer ratio |
+| 5/26 | `2A_alpha…_tta` | 0.3369 | 0.3197 | 0.7539 | 0.3878 | 2.409 | 4.087 | **TTA** | TTA *hurt*: RMSE_V 3.74→4.09 crossed cliff (−0.029) |
+| 5/28 | **`2A_vegboost`** | **0.3721** | 0.3331 | 0.7642 | 0.4154 | 2.279 | 3.704 | raw | **current best**; under cliff |
+| 6/1  | `7A_geocv_baseline_tta` | 0.3575 | 0.3403 | 0.7981 | 0.4138 | 2.348 | 4.093 | TTA+blend+thresh | over cliff |
+| 6/8  | `7A_v1_base` | 0.3392 | 0.3263 | 0.7915 | 0.3602 | 2.401 | 4.128 | raw | over cliff; water collapsed (see f29) |
 
-> **Current best platform score: 0.3721 (submission 2 — 2A_vegboost)**
-> 7A regressed on aggregate score because RMSE_V=4.09m crossed the 3.9m scoring cliff.
-> 7A is architecturally superior on IoU_V (+0.033) and IoU_W (+0.044). The regression is a training-side problem (missing veg_height_boost in DualPathLoss), not an architectural one.
+> **Current best platform score: 0.3721 (`2A_vegboost`, raw, 5/28).**
+> **Two corrected lessons (supersede earlier notes):**
+> 1. **TTA is unsafe here** — it smears the height regression and pushed `2A_alpha` RMSE_V 3.74→4.09
+>    over the 3.9 m cliff, costing −0.029 (0.366→0.337). Do not use TTA unless comfortably under cliff.
+> 2. **7A is NOT architecturally superior on the platform** (earlier claim retracted). Its internal
+>    IoU_W/IoU_B leads are largely fold-0 overfit and do **not** transfer (finding 29). On the platform
+>    7A_v1_base IoU_B (0.326) is *below* 2A_vegboost (0.333); its only honest edge is IoU_V.
+> The RMSE_V < 3.9 m cliff is the dominant aggregate-score lever: every strong submission clears it;
+> every 7A run is stuck at ~4.1 (forfeits the 20% height term). 7A floors at ~4.0 m standalone → a
+> **hybrid** (7A fractions + sub-cliff height) is the near-term path above 0.372.
 > 6A family produced nothing submission-worthy — proxy 0.24 max vs 2A's 0.37.
 
 **Leaderboard snapshot (as of 2026-06-01) — top 8 teams:**
@@ -514,3 +524,46 @@ stay fp32); the `expandable_segments` fragmentation reclaim is what closes the l
   boundary / Dice term on the binary head) or **input resolution/features** — not the multi-task
   plumbing. *Building-objective experiments are the leading next candidate, pending discussion.*
 - P3b (SAR-safe aug) and P2 (patch ablate-out) still open but lower priority.
+
+---
+
+## Internal↔Platform Transfer Analysis (2026-06-08)
+
+### 29. Single-fold (fold-0) validation is a biased, over-optimistic estimator — for 7A specifically
+Comparing each submitted model's **internal best-epoch** metrics (unified C=4 proxy from
+`training_params.txt`) against its **platform** result. Δ = platform − internal:
+
+| Experiment | Δ score | Δ IoU_B | Δ IoU_W | Δ RMSE_B | Δ RMSE_V | net |
+|-----------|---------|---------|---------|----------|----------|-----|
+| `2A_alpha_nologits` | **+0.043** | +0.147 | −0.169 | −0.72 | +0.04 | magnified |
+| `4A_hook` | **+0.067** | +0.150 | −0.139 | −1.00 | +0.01 | magnified |
+| `2A_vegboost` | **+0.046** | +0.144 | −0.157 | −0.73 | +0.02 | magnified |
+| `7A_geocv_baseline` | **−0.037** | +0.140 | −0.274 | +0.26 | +0.10 | attenuated |
+| `7A_v1_base` | **−0.061** | +0.097 | −0.320 | +0.31 | +0.09 | attenuated |
+
+The magnify→attenuate flip is **architectural, not temporal** (early wins = 2A/4A; recent = 7A):
+
+- **IoU_B magnifies for all (+0.10–0.15)** — platform test buildings are easier than fold-0 val. But
+  **7A_v1_base magnifies the *least* (+0.097)** despite the highest internal IoU_B (0.229): its
+  building lead transfers worst. On the platform 7A_v1_base IoU_B (0.326) is **below** 2A_vegboost
+  (0.333).
+- **IoU_W is the killer and hits 7A 2× harder**: 2A/4A drop ~−0.15, **7A drops −0.27 to −0.32**.
+  7A's internal water (0.68) is inflated and collapses to 0.36–0.41 on the different-region test.
+- **RMSE_B confirms direction**: 2A/4A *under*-fit fold-0 (platform better, Δ −0.7 to −1.0); 7A
+  *over*-fit it (platform worse, Δ +0.26 to +0.31).
+
+**Conclusion.** 2A/4A earn their proxy from modest, honest components that transfer or improve, so
+platform ≥ internal. 7A earns a *higher* proxy by **overfitting the fold-0 holdout (esp. water, the
+rare class that "ignites" to 0.68)** — exactly the components that collapse on a new region. The
+larger 7A model (18.6 M, dual-encoder + cross-attn, selected on one geo-fold) memorises fold-0;
+2A is too simple to overfit that hard.
+
+**Implications (these reshape the plan):**
+- **Internal IoU_B is not a trustworthy north star for 7A.** A single-fold IoU_B "win" may be fold-0
+  overfit. → **Validate the Phase-9 campaign on multiple geo-folds** (an improvement must hold across
+  folds to count), or confirm on the platform. No code change needed — train with `--cv-fold 0/1/2`.
+- **Do NOT push 7A water via oversampling (P3a)** — it deepens the overfit already costing −0.32 on
+  transfer. The water fix is **domain generalization** (embedding-space augmentation), not fold-0
+  sampling.
+- **7A's only honest platform edge is IoU_V**; its building/water leads are largely fold-0 mirages.
+- **4A_hook transfers best** (+0.067, clears the cliff) and is a strong base to revisit.
