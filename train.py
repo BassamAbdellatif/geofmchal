@@ -200,6 +200,12 @@ def parse_args():
                         help="[7A] Directory for the memmap float16 tile cache. If set, "
                              "tiles are preprocessed once and served from the (page-cached) "
                              "memmap on later epochs — turns the IO-bound run compute-bound.")
+    parser.add_argument("--scratch-dir", type=str, default=None,
+                        help="[I/O] Write run outputs (checkpoints/params/curve) to this LOCAL "
+                             "dir (e.g. NVMe) during training, then copy to the NFS runs/ dir at "
+                             "the end. Avoids the per-epoch 74MB checkpoint + per-epoch param "
+                             "writes to a busy NFS that can stall the loop. Tee the log to the "
+                             "same local dir too. Default None = write directly to NFS runs/.")
     parser.add_argument("--rebuild-cache", action="store_true",
                         help="[7A] Force rebuild of the tile cache even if a .done flag exists.")
     parser.add_argument("--no-height-bridge", action="store_true",
@@ -656,9 +662,16 @@ def train_7a(args):
         if (args.amp and device.type == "cuda") else nullcontext
     if args.amp:
         print("   >> AMP on (bf16 autocast, train+eval forward)")
-    runs_dir = _runs_dir_7a()
-    exp_dir = os.path.join(runs_dir, args.experiment_name)
+    nfs_runs_dir = _runs_dir_7a()
+    nfs_exp_dir = os.path.join(nfs_runs_dir, args.experiment_name)
+    # [I/O] Write to a local scratch dir (NVMe) during the run when --scratch-dir is
+    # set, then copy to the NFS runs/ dir at the end. Avoids per-epoch NFS writes
+    # (74MB checkpoint saves + the param appends) that can stall on a busy NFS.
+    out_root = args.scratch_dir if args.scratch_dir else nfs_runs_dir
+    exp_dir = os.path.join(out_root, args.experiment_name)
     os.makedirs(exp_dir, exist_ok=True)
+    if args.scratch_dir:
+        print(f"   >> scratch I/O: outputs -> {exp_dir} (local), copied to {nfs_exp_dir} at end")
     best_path = os.path.join(exp_dir, "model_best.pth")
     last_path = os.path.join(exp_dir, "model_last.pth")
     cfg_path = os.path.join(exp_dir, "training_params.txt")
@@ -862,6 +875,20 @@ def train_7a(args):
         plt.savefig(curve_path); plt.close()
     except Exception as e:
         print(f"   (curve plot skipped: {e})")
+
+    # [I/O] Bulk-copy local scratch outputs to the NFS runs/ dir (one transfer at
+    # the end instead of per-epoch NFS writes). Includes train.log if tee'd here.
+    if args.scratch_dir and os.path.abspath(exp_dir) != os.path.abspath(nfs_exp_dir):
+        import shutil
+        try:
+            os.makedirs(nfs_exp_dir, exist_ok=True)
+            for fn in os.listdir(exp_dir):
+                src = os.path.join(exp_dir, fn)
+                if os.path.isfile(src):
+                    shutil.copy2(src, os.path.join(nfs_exp_dir, fn))
+            print(f"   >> copied run outputs to NFS: {nfs_exp_dir}")
+        except Exception as e:
+            print(f"   (NFS copy failed; outputs remain local at {exp_dir}: {e})")
 
     return best_proxy
 
