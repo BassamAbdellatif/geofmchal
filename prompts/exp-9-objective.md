@@ -102,3 +102,36 @@ buildings (IoU_B up but IoU_V/precision down), tune α/β toward 0.4/0.6.
 - Leave the binary head and its weight (1.70) unchanged — it shapes the encoder, not the metric.
 - Report any fork with multiple reasonable paths instead of picking silently; STOP at the smoke
   checkpoint.
+
+---
+
+## Validation protocol & campaign (post-smoke) — multi-fold, P/R-aimed
+
+Smoke is **done & passing** (byte-identical-off verified; all 5 configs finite/grad-ok). The P/R
+diagnostic (finding 30) shows building is **recall-limited**, so the campaign is aimed at P1
+(Tversky), keeps the softmax4+tversky combo as the "does *other* help precision" test, and **drops
+pure softmax4** (it worsens recall). Selection is **geo multi-fold** (finding 31): an arm wins only
+if it beats the anchor on **both** folds; the final submission model is later trained on all 5 folds.
+
+### Arms (3 configs × folds {0,1} = 6 runs), 40 epochs, seed 0, `--amp`
+| name | extra flags vs `7A_v1_base` |
+|------|-----------------------------|
+| `9_anchor_f{0,1}` | — (seeded default = control) |
+| `9_tversky_f{0,1}` | `--building-overlap tversky --tversky-alpha 0.3 --tversky-beta 0.7` |
+| `9_sm4tv_f{0,1}` | `--fraction-head softmax4 --building-overlap tversky --tversky-alpha 0.3 --tversky-beta 0.7` |
+
+### Waves (4 nodes)
+- **Wave 1 (fold 0 + fold-1 control):** `9_anchor_f0`, `9_tversky_f0`, `9_sm4tv_f0`, `9_anchor_f1`.
+- **Wave 2 (fold-1 arms):** `9_tversky_f1`, `9_sm4tv_f1` (2 nodes; 2 free, reserved for expansion).
+
+### Read-out & gates
+- **IoU_B**: last-10-epoch mean per run; Δ = arm − anchor *within each fold*. Win = Δ>0 on **both**
+  folds, magnitude above the ±0.02–0.03 swing.
+- **IoU_W gate**: watch epoch 2–3 ignition (finding 24); softmax4 makes water compete with *other* —
+  if IoU_W stays ~0, the combo is killing rare classes.
+- **Precision check**: for `9_sm4tv` vs `9_tversky`, compare building FP (the "other"-sink should cut
+  false positives) — if it doesn't beat plain Tversky, *other* isn't earning its keep.
+
+### Conditional expansion (only if Wave 1/2 shows signal)
+Add a gentler `--tversky-alpha 0.4 --tversky-beta 0.6` arm and extend to **fold 2** (folds 0+1+2)
+to confirm before committing to an all-folds final-model train.
