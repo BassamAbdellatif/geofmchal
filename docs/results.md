@@ -458,3 +458,59 @@ every run regardless of `--seed`. Fine ablations (±0.01 IoU) are noise-limited 
 - New line **`exp-8-decouple`** (targets IoU_B): seed augmentation; single-task ablations
   (is multi-task interference real?); aggressive rare-class oversampling; symmetric cross-encoder
   gradients (tessera→fraction bridge, GradScale sweep); SAR-safe (no-rotation) augmentation.
+
+---
+
+## 7A Phase 8 — Task/Encoder Decoupling + Rare-Class Robustness (2026-06-08) — NEGATIVE (P4, P3a)
+
+Branch `exp-8-decouple` (from `exp-7-clean-slate` HEAD). Spec: `prompts/exp-8-decouple.md`.
+Goal: raise **IoU_B** (worst class, #1 platform gap) without regressing IoU_W/IoU_V; raw-0.5
+prediction only (no calibration). All runs: geo-CV fold 0, hard-IoU@0.5, v1 stem, batch 32,
+static weights `[0.65,0.64,1.70]`, no GradNorm/vegboost, **seeded augmentation (finding 25 fixed)**,
+**40 epochs** (cut from 60 for economy — all plateaued well before 40).
+
+**Methodology note:** IoU_B oscillates ±0.02–0.03 epoch-to-epoch, so the proxy-best *peak* rewards
+luck. Numbers below are the **last-10-epoch mean** (the run's own swing in parens). Between-run
+differences are all *smaller* than the within-run swing → treat them as ties unless stated.
+
+### Campaign
+| Run | Config | IoU_B | IoU_W | IoU_V | RMSE_V |
+|-----|--------|-------|-------|-------|--------|
+| `7A_v1_base_seeded` (anchor) | joint, default sampler `1,1.5,2,3` | **0.178** (0.171–0.185) | 0.685 | 0.806 | 4.05m |
+| `8_strata_1248` (P3a) | joint, sampler `1,2,4,8` | 0.190 (0.171–0.205) | 0.683 | 0.808 | 4.10m |
+| `8_frac_only` (P4) | `--task fraction` (drop height) | 0.183 (0.164–0.206) | 0.674 | 0.799 | — |
+| `8_height_only` (P4) | `--task height` (drop fraction+binary) | — | — | — | **3.91m ↓** |
+
+### 26. Multi-task interference is NOT the building bottleneck (P4)
+Fraction-only IoU_B (0.183) = joint anchor (0.178), inside noise. Isolating the fraction task
+frees **zero** building capacity → the height task is not stealing from buildings. Only isolation
+effect is a small height gain (height-only RMSE_V 3.91 vs 4.05 joint) — minor, and not our gap
+metric. **The loss combination is not the problem.**
+
+### 27. Aggressive rare-class oversampling buys nothing (P3a)
+4× rare-stratum weight (`1,2,4,8`) lands IoU_B 0.190 / IoU_W 0.683 — both on the anchor (+0.012
+IoU_B is within swing). **Water is saturated at ~0.68; buildings capped at ~0.18 regardless of
+sampling frequency.** P3a closed-negative. (Refines finding 24: rare-class *frequency* is not the
+water/building lever once ignition has occurred.)
+
+### 28. The IoU_B ~0.18 ceiling is intrinsic
+Invariant across task-separation (f26) AND 4× oversampling (f27): neither interference nor
+frequency. The ceiling is structural — building objective formulation, label/resolution quality,
+or input features. NB: seeded anchor IoU_B is **~0.18**, below the **0.20** quoted from the
+pre-seeding run (that was a lucky peak; seeding removed the optimism — corrects finding-table value).
+
+### Infra note — AMP fits bs32 on 48 GB Ada, and preserves water
+`--amp` (bf16 autocast) + `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` fits the 7A model at
+batch 32 on the RTX 6000 Ada nodes (n1/n2 OOM'd in fp32 at the ~46.7 GB margin). Critically, bf16
+**preserves the fragile water ignition** (`8_frac_only` ignited 0.27→0.57→0.67 under AMP) — so the
+gradient-checkpointing fallback was not needed. autocast alone is insufficient memory-wise (weights
+stay fp32); the `expandable_segments` fragmentation reclaim is what closes the last ~1.8 GB.
+
+### Phase 8 interim verdict & forward plan
+- **P3a: closed-negative.** No more sampling-weight experiments.
+- **P1 (cross-encoder gradients): DEMOTED** to at most one cheap probe — premise undercut by f26
+  (if total task isolation can't move IoU_B, re-routing gradient share won't either).
+- **Reframe:** the honest IoU_B lever is the **building objective itself** (candidate: focal /
+  boundary / Dice term on the binary head) or **input resolution/features** — not the multi-task
+  plumbing. *Building-objective experiments are the leading next candidate, pending discussion.*
+- P3b (SAR-safe aug) and P2 (patch ablate-out) still open but lower priority.
