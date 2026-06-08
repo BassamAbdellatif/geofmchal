@@ -171,6 +171,27 @@ def parse_args():
                         help="[7A Phase 8] bf16 mixed precision (autocast) for train+eval forward. "
                              "~halves activation memory (bs32 ~42GB -> ~24GB) so the 7A model fits "
                              "with headroom on a 48GB GPU. Default off (fp32, byte-identical).")
+    # --- [Phase 9] Building-objective redesign (P1 + P2) ---
+    parser.add_argument("--fraction-head", type=str, default="sigmoid3",
+                        choices=["sigmoid3", "softmax4"],
+                        help="[Phase 9 P2] Fraction head: 'sigmoid3' (default, byte-identical; "
+                             "3 independent sigmoids) or 'softmax4' (building/veg/water/other "
+                             "4-way softmax simplex; 'other'=1-b-v-w derived).")
+    parser.add_argument("--building-overlap", type=str, default="dice",
+                        choices=["dice", "tversky", "focal_tversky"],
+                        help="[Phase 9 P1] Overlap loss on the building channel: 'dice' (default, "
+                             "class-blind, byte-identical), 'tversky', or 'focal_tversky'.")
+    parser.add_argument("--tversky-alpha", type=float, default=0.3,
+                        help="[Phase 9 P1] Tversky FP weight (used by tversky/focal_tversky).")
+    parser.add_argument("--tversky-beta", type=float, default=0.7,
+                        help="[Phase 9 P1] Tversky FN weight (beta>alpha favours building recall).")
+    parser.add_argument("--focal-tversky-gamma", type=float, default=1.333,
+                        help="[Phase 9 P1] Focal-Tversky focusing exponent ((1-T)**(1/gamma)).")
+    parser.add_argument("--building-overlap-weight", type=float, default=1.0,
+                        help="[Phase 9 P1] Multiplier on the building overlap term vs veg/water.")
+    parser.add_argument("--dice-k", type=float, default=5.0,
+                        help="[Phase 9 P1] Sharpness of the shifted-sigmoid Dice relaxation "
+                             "(sigmoid3 path). Default 5.0 = byte-identical.")
     parser.add_argument("--max-batches", type=int, default=0, help="If >0, cap batches per epoch (smoke testing).")
     parser.add_argument("--veg-height-boost", type=float, default=0.0,
                         help="[7A P5.1] Extra weight on masked Huber for vegetation pixels "
@@ -548,7 +569,8 @@ def _runs_dir_7a():
 
 
 @torch.no_grad()
-def evaluate_7a(model, val_loader, criterion, device, C=4.0, amp=False):
+def evaluate_7a(model, val_loader, criterion, device, C=4.0, amp=False,
+                fraction_head="sigmoid3"):
     """Hard-IoU@0.5 (B/V/W), masked RMSE in metres (B/V), proxy (C=4.0), val losses."""
     model.eval()
     inter = torch.zeros(3, device=device)
@@ -571,7 +593,11 @@ def evaluate_7a(model, val_loader, criterion, device, C=4.0, amp=False):
             task_sums[k] += float(losses[k].detach())
         nb += 1
 
-        pred = torch.cat([torch.sigmoid(out["fraction"]), out["height"]], dim=1)
+        if fraction_head == "softmax4":
+            frac_prob = torch.softmax(out["fraction"], dim=1)[:, :3]
+        else:
+            frac_prob = torch.sigmoid(out["fraction"])
+        pred = torch.cat([frac_prob, out["height"]], dim=1)
         for c in range(3):
             p = pred[:, c] > 0.5
             t = target[:, c] > 0.5
@@ -662,6 +688,13 @@ def train_7a(args):
         f.write(f"TASK: {args.task}\n")
         f.write(f"STRATA_WEIGHTS: {args.strata_weights}\n")
         f.write(f"AMP: {args.amp}\n")
+        f.write(f"FRACTION_HEAD: {args.fraction_head}\n")
+        f.write(f"BUILDING_OVERLAP: {args.building_overlap}\n")
+        f.write(f"TVERSKY_ALPHA: {args.tversky_alpha}\n")
+        f.write(f"TVERSKY_BETA: {args.tversky_beta}\n")
+        f.write(f"FOCAL_TVERSKY_GAMMA: {args.focal_tversky_gamma}\n")
+        f.write(f"BUILDING_OVERLAP_WEIGHT: {args.building_overlap_weight}\n")
+        f.write(f"DICE_K: {args.dice_k}\n")
         f.write(f"SEED: {args.seed}\n")
         f.write(f"OPTIMIZER: AdamW lr={LEARNING_RATE} wd={WEIGHT_DECAY}\n")
 
@@ -702,13 +735,21 @@ def train_7a(args):
                            xattn_heads=args.xattn_heads,
                            patch_routing=args.patch_routing,
                            use_fraction_bridge=args.use_fraction_bridge,
-                           fraction_bridge_alpha=args.fraction_bridge_alpha)
+                           fraction_bridge_alpha=args.fraction_bridge_alpha,
+                           fraction_head=args.fraction_head)
     model = model.to(device)
     print(f"   >> params: {sum(p.numel() for p in model.parameters())/1e6:.2f}M"
           f"  (height_bridge={'off' if args.no_height_bridge else 'on'})")
 
     criterion = DualPathLoss(veg_height_boost=args.veg_height_boost,
-                             use_binary=not args.no_binary_head).to(device)
+                             use_binary=not args.no_binary_head,
+                             fraction_head=args.fraction_head,
+                             building_overlap=args.building_overlap,
+                             tversky_alpha=args.tversky_alpha,
+                             tversky_beta=args.tversky_beta,
+                             focal_tversky_gamma=args.focal_tversky_gamma,
+                             building_overlap_weight=args.building_overlap_weight,
+                             dice_k=args.dice_k).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
@@ -780,7 +821,8 @@ def train_7a(args):
         train_hist.append(epoch_loss)
         ep_task = {k: v / max(1, seen) for k, v in ep_task.items()}
 
-        metrics = evaluate_7a(model, val_loader, criterion, device, amp=args.amp)
+        metrics = evaluate_7a(model, val_loader, criterion, device, amp=args.amp,
+                              fraction_head=args.fraction_head)
         proxy_hist.append(metrics["proxy"])
 
         if metrics["proxy"] > best_proxy:
