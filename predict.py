@@ -584,6 +584,7 @@ def predict_7a(args, exp_dir, params):
     patch_routing = params.get("PATCH_ROUTING", "sensor").strip()
     use_fraction_bridge = params.get("USE_FRACTION_BRIDGE", "False").strip().lower() == "true"
     fraction_bridge_alpha = float(params.get("FRACTION_BRIDGE_ALPHA", "0.2"))
+    fraction_head = params.get("FRACTION_HEAD", "sigmoid3").strip()
     use_thor = any(p.startswith("thor") for p in patch_names)
 
     model, _ = build_model("dual_enc_dec_fusion", n_channels=64, n_classes=4,
@@ -593,7 +594,8 @@ def predict_7a(args, exp_dir, params):
                            xattn_heads=xattn_heads,
                            patch_routing=patch_routing,
                            use_fraction_bridge=use_fraction_bridge,
-                           fraction_bridge_alpha=fraction_bridge_alpha)
+                           fraction_bridge_alpha=fraction_bridge_alpha,
+                           fraction_head=fraction_head)
     model = model.to(device)
     state = torch.load(model_path, map_location=device)
     state = _remap_legacy_7a_state_dict(state, model)
@@ -612,11 +614,18 @@ def predict_7a(args, exp_dir, params):
         for tile in tqdm(tiles, desc=desc):
             batch = {k: v.to(device) for k, v in _load_test_tile_7a(tile, norm_stats, patch_names).items()}
             logits = _tta_logits_7a(model, batch) if use_tta else _raw_logits_7a(model, batch)
-            logits = logits.squeeze(0)                       # (5,H,W)
+            logits = logits.squeeze(0)                       # (nf+2,H,W)
 
-            frac = torch.sigmoid(logits[:3]).cpu().numpy()
-            binary = torch.sigmoid(logits[3]).cpu().numpy()
-            height = (logits[4] * HEIGHT_NORM_CONSTANT).cpu().numpy()
+            if fraction_head == "softmax4":
+                # 4-way softmax over [building,veg,water,other]; keep the 3 goal
+                # channels. binary/height shift by one (fraction has 4 channels).
+                frac = torch.softmax(logits[:4], dim=0)[:3].cpu().numpy()
+                binary = torch.sigmoid(logits[4]).cpu().numpy()
+                height = (logits[5] * HEIGHT_NORM_CONSTANT).cpu().numpy()
+            else:
+                frac = torch.sigmoid(logits[:3]).cpu().numpy()
+                binary = torch.sigmoid(logits[3]).cpu().numpy()
+                height = (logits[4] * HEIGHT_NORM_CONSTANT).cpu().numpy()
 
             if blend:
                 m = binary > 0.5

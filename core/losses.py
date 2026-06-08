@@ -207,6 +207,25 @@ def _soft_dice(pred, target, smooth=1.0):
     return torch.mean(1.0 - dice)
 
 
+def _soft_tversky(pred, target, alpha, beta, gamma=1.0, smooth=1.0):
+    """(Focal) Tversky loss over (B,H,W) prob vs binary target (per-sample, mean over batch).
+
+    alpha weights false positives, beta weights false negatives; beta>alpha favours
+    recall (good for under-predicted rare classes like buildings). gamma=1.0 is plain
+    Tversky; gamma>1 focuses on hard/low-overlap samples ((1-T)**(1/gamma)).
+    alpha=beta=0.5, gamma=1.0 reduces to soft Dice.
+    """
+    dims = tuple(range(1, pred.dim()))
+    tp = torch.sum(pred * target, dim=dims)
+    fp = torch.sum(pred * (1.0 - target), dim=dims)
+    fn = torch.sum((1.0 - pred) * target, dim=dims)
+    tversky = (tp + smooth) / (tp + alpha * fp + beta * fn + smooth)
+    loss = 1.0 - tversky
+    if gamma != 1.0:
+        loss = loss ** (1.0 / gamma)
+    return torch.mean(loss)
+
+
 class DualPathLoss(nn.Module):
     """
     Loss for the 7A dual-decoder model.
@@ -227,12 +246,23 @@ class DualPathLoss(nn.Module):
 
     def __init__(self, dice_lambda=1.0, dice_k=5.0, huber_delta=0.5,
                  height_bg_weight=0.1, veg_height_boost=0.0, veg_boost_thresh=0.1,
-                 use_binary=True):
+                 use_binary=True, fraction_head="sigmoid3", building_overlap="dice",
+                 tversky_alpha=0.3, tversky_beta=0.7, focal_tversky_gamma=1.333,
+                 building_overlap_weight=1.0):
         """
         veg_height_boost: extra weight on the masked Huber for vegetation pixels
             (veg_frac > veg_boost_thresh). Default 0.0 reproduces the Phase-4
             baseline exactly; set >0 (e.g. 2-3) to pull RMSE_V back under the
             3.9 m scoring floor — mirrors the veg_height_boost that helped 2A.
+
+        [Phase 9 P1] building_overlap: overlap loss on the building channel —
+            'dice' (default; class-blind, byte-identical), 'tversky', or
+            'focal_tversky'. tversky_alpha/beta weight FP/FN (beta>alpha favours
+            building recall); focal_tversky_gamma focuses on hard samples;
+            building_overlap_weight scales the building term vs veg/water.
+        [Phase 9 P2] fraction_head: 'sigmoid3' (default; 3 independent sigmoids,
+            byte-identical) or 'softmax4' (building/veg/water/other 4-way softmax
+            simplex; 'other' = 1 - b - v - w, derived).
         """
         super().__init__()
         self.dice_lambda = dice_lambda
@@ -242,9 +272,65 @@ class DualPathLoss(nn.Module):
         self.veg_height_boost = veg_height_boost
         self.veg_boost_thresh = veg_boost_thresh
         self.use_binary = use_binary
+        self.fraction_head = fraction_head
+        self.building_overlap = building_overlap
+        self.tversky_alpha = tversky_alpha
+        self.tversky_beta = tversky_beta
+        self.focal_tversky_gamma = focal_tversky_gamma
+        self.building_overlap_weight = building_overlap_weight
+
+    def _building_overlap_term(self, pred_c, tgt_c):
+        """Overlap loss for the building channel (B,H,W prob vs binary target)."""
+        if self.building_overlap == "dice":
+            return _soft_dice(pred_c, tgt_c)
+        gamma = self.focal_tversky_gamma if self.building_overlap == "focal_tversky" else 1.0
+        return _soft_tversky(pred_c, tgt_c, self.tversky_alpha, self.tversky_beta, gamma)
+
+    def _fraction_loss(self, frac_logits, frac_target):
+        """Fraction-path loss. Default (sigmoid3 + class-blind dice) is byte-identical
+        to the pre-Phase-9 path; other configs take a per-channel / softmax branch."""
+        is_default = (self.fraction_head == "sigmoid3"
+                      and self.building_overlap == "dice"
+                      and self.building_overlap_weight == 1.0
+                      and self.dice_k == 5.0)
+        if is_default:
+            # --- EXACT original path (do not refactor: lumped 3-ch Dice). ---
+            frac_prob = torch.sigmoid(frac_logits)
+            loss_mae = torch.mean(torch.abs(frac_prob - frac_target))
+            dice_pred = torch.sigmoid(self.dice_k * (frac_logits - 0.5))
+            dice_tgt = (frac_target > 0.5).float()
+            loss_dice = _soft_dice(dice_pred, dice_tgt)
+            return loss_mae + self.dice_lambda * loss_dice
+
+        if self.fraction_head == "softmax4":
+            # 4-way softmax simplex over [building, veg, water, other]; 'other' derived.
+            other = (1.0 - frac_target.sum(dim=1)).clamp(0.0, 1.0)       # (B,H,W)
+            target4 = torch.cat([frac_target, other.unsqueeze(1)], dim=1)  # (B,4,H,W)
+            prob = torch.softmax(frac_logits, dim=1)                     # (B,4,H,W)
+            loss_mae = torch.mean(torch.abs(prob - target4))
+            # Overlap on the 3 supervised goal channels (building-aware on ch0);
+            # 'other' is a derived sink — MAE only, no overlap term.
+            b = self.building_overlap_weight * self._building_overlap_term(
+                prob[:, 0], (target4[:, 0] > 0.5).float())
+            v = _soft_dice(prob[:, 1], (target4[:, 1] > 0.5).float())
+            w = _soft_dice(prob[:, 2], (target4[:, 2] > 0.5).float())
+            loss_overlap = (b + v + w) / 3.0
+            return loss_mae + self.dice_lambda * loss_overlap
+
+        # sigmoid3 with a non-default building overlap: per-channel decomposition.
+        frac_prob = torch.sigmoid(frac_logits)
+        loss_mae = torch.mean(torch.abs(frac_prob - frac_target))
+        dice_pred = torch.sigmoid(self.dice_k * (frac_logits - 0.5))
+        dice_tgt = (frac_target > 0.5).float()
+        b = self.building_overlap_weight * self._building_overlap_term(
+            dice_pred[:, 0], dice_tgt[:, 0])
+        v = _soft_dice(dice_pred[:, 1], dice_tgt[:, 1])
+        w = _soft_dice(dice_pred[:, 2], dice_tgt[:, 2])
+        loss_overlap = (b + v + w) / 3.0
+        return loss_mae + self.dice_lambda * loss_overlap
 
     def forward(self, outputs, target):
-        frac_logits = outputs["fraction"]          # (B,3,H,W)
+        frac_logits = outputs["fraction"]          # (B,3|4,H,W)
         height_pred = outputs["height"][:, 0]      # (B,H,W)
 
         frac_target = target[:, :3]                # (B,3,H,W) in [0,1]
@@ -252,13 +338,7 @@ class DualPathLoss(nn.Module):
         build_frac = target[:, 0]
         veg_frac = target[:, 1]
 
-        # Fractions: MAE (calibration) + soft Dice at the 0.5 boundary.
-        frac_prob = torch.sigmoid(frac_logits)
-        loss_mae = torch.mean(torch.abs(frac_prob - frac_target))
-        dice_pred = torch.sigmoid(self.dice_k * (frac_logits - 0.5))
-        dice_tgt = (frac_target > 0.5).float()
-        loss_dice = _soft_dice(dice_pred, dice_tgt)
-        loss_fraction = loss_mae + self.dice_lambda * loss_dice
+        loss_fraction = self._fraction_loss(frac_logits, frac_target)
 
         # Height: Huber, masked (building OR veg present) + small bg tail.
         mask = ((build_frac > 0) | (veg_frac > 0)).float()

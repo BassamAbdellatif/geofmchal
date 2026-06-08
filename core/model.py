@@ -341,7 +341,8 @@ def build_model(model_type, n_channels, n_classes, use_height_bridge=True,
                 patch_inputs=("terramind_s1", "terramind_s2"),
                 patch_stem_version="v2", xattn_heads=4,
                 patch_routing="sensor",
-                use_fraction_bridge=False, fraction_bridge_alpha=0.2):
+                use_fraction_bridge=False, fraction_bridge_alpha=0.2,
+                fraction_head="sigmoid3"):
     selected = model_type.lower()
 
     if selected == "auto":
@@ -361,6 +362,7 @@ def build_model(model_type, n_channels, n_classes, use_height_bridge=True,
             patch_routing=patch_routing,
             use_fraction_bridge=use_fraction_bridge,
             fraction_bridge_alpha=fraction_bridge_alpha,
+            fraction_head=fraction_head,
         ), selected
 
     raise ValueError(
@@ -659,7 +661,7 @@ class FractionDecoder(nn.Module):
     Outputs: 3 fraction channels + 1 auxiliary binary-building channel.
     """
 
-    def __init__(self, xattn_heads=4, use_bridge=False, bridge_alpha=0.2):
+    def __init__(self, xattn_heads=4, use_bridge=False, bridge_alpha=0.2, num_classes=3):
         super().__init__()
         # [Phase 5E #1] Optional τ-bottleneck → fraction bridge, mirror of the
         # height bridge. Constructed only when enabled, so the default path is
@@ -674,7 +676,10 @@ class FractionDecoder(nn.Module):
         self.up2 = _UpBlock(_DEC[1], _ENC[2], _DEC[2])       # 32->64,  skip 192@64
         self.up3 = _UpBlock(_DEC[2], _ENC[1], _DEC[3])       # 64->128, skip 128@128
         self.up4 = _UpBlock(_DEC[3], _ENC[0], _DEC[4])       # 128->256,skip 96@256
-        self.frac_head = nn.Conv2d(_DEC[4], 3, 1)
+        # [Phase 9 P2] num_classes=3 (default) -> byte-identical sigmoid3 head;
+        # =4 -> softmax-4 simplex [building, veg, water, other]. binary_head is
+        # built after frac_head so its init RNG is unchanged when num_classes=3.
+        self.frac_head = nn.Conv2d(_DEC[4], num_classes, 1)
         self.binary_head = nn.Conv2d(_DEC[4], 1, 1)
 
     def forward(self, bottleneck, skips, s2_tokens, tessera_bottleneck=None):
@@ -772,11 +777,17 @@ class DualEncDualDecFusion(nn.Module):
                  patch_inputs=("terramind_s1", "terramind_s2"),
                  patch_stem_version="v2", xattn_heads=4,
                  patch_routing="sensor",
-                 use_fraction_bridge=False, fraction_bridge_alpha=0.2):
+                 use_fraction_bridge=False, fraction_bridge_alpha=0.2,
+                 fraction_head="sigmoid3"):
         super().__init__()
         self.patch_inputs = list(patch_inputs)
         self.patch_stem_version = patch_stem_version
         self.xattn_heads = xattn_heads
+        # [Phase 9 P2] 'sigmoid3' (default, byte-identical) or 'softmax4' simplex.
+        if fraction_head not in ("sigmoid3", "softmax4"):
+            raise ValueError(f"Unknown fraction_head {fraction_head!r}; "
+                             f"use 'sigmoid3' or 'softmax4'.")
+        self.fraction_head = fraction_head
         # [Phase 5E #4] sensor->branch routing. 'sensor' (default) = byte-identical
         # 7A: s1->height, s2->fraction. 's1-both' also feeds s1 into the fraction
         # branch (SAR for water/building). 'all-both' feeds everything to both.
@@ -797,7 +808,8 @@ class DualEncDualDecFusion(nn.Module):
         self._s2_names = [n for n in self.patch_inputs if n.endswith("_s2")]
         self.fraction_decoder = FractionDecoder(xattn_heads=xattn_heads,
                                                 use_bridge=use_fraction_bridge,
-                                                bridge_alpha=fraction_bridge_alpha)
+                                                bridge_alpha=fraction_bridge_alpha,
+                                                num_classes=4 if fraction_head == "softmax4" else 3)
         self.height_decoder = HeightDecoder(bridge_alpha=bridge_alpha,
                                             use_bridge=use_height_bridge,
                                             xattn_heads=xattn_heads)
@@ -841,5 +853,9 @@ class DualEncDualDecFusion(nn.Module):
     @torch.no_grad()
     def predict(self, batch):
         out = self.forward(batch)
-        frac = torch.sigmoid(out["fraction"])
+        if self.fraction_head == "softmax4":
+            # 4-way softmax, then drop the derived 'other' channel for the metric.
+            frac = torch.softmax(out["fraction"], dim=1)[:, :3]
+        else:
+            frac = torch.sigmoid(out["fraction"])
         return torch.cat([frac, out["height"]], dim=1)   # (B,4,256,256)
