@@ -664,17 +664,20 @@ def train_7a(args):
         print("   >> AMP on (bf16 autocast, train+eval forward)")
     nfs_runs_dir = _runs_dir_7a()
     nfs_exp_dir = os.path.join(nfs_runs_dir, args.experiment_name)
-    # [I/O] Write to a local scratch dir (NVMe) during the run when --scratch-dir is
-    # set, then copy to the NFS runs/ dir at the end. Avoids per-epoch NFS writes
-    # (74MB checkpoint saves + the param appends) that can stall on a busy NFS.
+    os.makedirs(nfs_exp_dir, exist_ok=True)
+    # [I/O] When --scratch-dir is set, the HEAVY writers (74MB checkpoints + curve)
+    # go to local NVMe during the run and are copied to NFS at the end. The tiny
+    # per-epoch training_params.txt append stays on NFS so the run is monitorable
+    # live and the metrics record is always there even if the run dies.
     out_root = args.scratch_dir if args.scratch_dir else nfs_runs_dir
     exp_dir = os.path.join(out_root, args.experiment_name)
     os.makedirs(exp_dir, exist_ok=True)
     if args.scratch_dir:
-        print(f"   >> scratch I/O: outputs -> {exp_dir} (local), copied to {nfs_exp_dir} at end")
+        print(f"   >> scratch I/O: checkpoints/curve -> {exp_dir} (local), copied to "
+              f"{nfs_exp_dir} at end; training_params.txt stays on NFS for live monitoring")
     best_path = os.path.join(exp_dir, "model_best.pth")
     last_path = os.path.join(exp_dir, "model_last.pth")
-    cfg_path = os.path.join(exp_dir, "training_params.txt")
+    cfg_path = os.path.join(nfs_exp_dir, "training_params.txt")   # NFS: live monitoring + record
     curve_path = os.path.join(exp_dir, "loss_curve.png")
 
     with open(cfg_path, "w") as f:
