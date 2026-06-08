@@ -567,3 +567,34 @@ larger 7A model (18.6 M, dual-encoder + cross-attn, selected on one geo-fold) me
   sampling.
 - **7A's only honest platform edge is IoU_V**; its building/water leads are largely fold-0 mirages.
 - **4A_hook transfers best** (+0.067, clears the cliff) and is a strong base to revisit.
+
+### 30. Building is recall-limited (mildly) — P/R diagnostic on `7A_v1_base`, fold 0
+`pr_diagnostic.py` decomposing the building channel @0.5:
+
+| class | precision | recall | IoU | TP / FP / FN |
+|-------|-----------|--------|-----|--------------|
+| **building** | 0.393 | 0.354 | 0.229 | 91k / 141k / **167k** |
+| veg | 0.886 | 0.903 | 0.809 | — |
+| water | 0.884 | 0.746 | 0.680 | — |
+
+Building threshold sweep: IoU 0.243 @0.30 → 0.238 @0.40 → **0.229 @0.50** → 0.213 @0.60.
+
+Recall (0.354) < precision (0.393), FN (167k) > FP (141k), and IoU *rises* as the threshold drops
+→ the model **under-calls buildings at 0.5**. **Verdict: recall-limited → P1/Tversky (β>α) is the
+lever** (pushes building prob up so more pixels cross 0.5, no calibration). **P2/softmax4 pushes the
+wrong way** (suppresses positives near 0.25 → worsens recall). Caveats: (a) both axes are weak
+(~+0.014 IoU headroom from the operating point) → P1 is a *modest* lever, not a breakthrough; big
+building gains likely need features/resolution (f28). (b) fold-0 only — direction is stable, but
+buildings *magnify* on the platform (0.229 → 0.326), so the recall gap may be gentler on the real test.
+
+### 31. Validation methodology decision — geo multi-fold for selection, train-final on all
+**Decision:** select the Phase-9 recipe on **geo multi-fold (folds 0 + 1)**; train the **final
+submission model on all 5 folds**. An arm counts as a win only if it beats the anchor on *both* folds.
+**Why not random / stratified-random split:** the platform test is a *new region + year* (OOD). A
+random or stratified-random val puts validation tiles next to their training neighbours → spatial
+autocorrelation **leakage** → an optimistic *in-distribution* estimate that won't transfer. f29
+already showed geo-CV is over-optimistic for 7A; a leaky split would mislead *more*. Geo multi-fold
+measures extrapolation to an unseen region (mimics the test) and, averaged over folds, still "sees
+all variants" as held-out. "Use all data" is a *training* concern, satisfied by training the final
+model on all folds — not a reason to leak the validation. (Buffered/blocked CV is the only stronger
+option but adds code; plain geo multi-fold is the faithful, simpler choice.)
