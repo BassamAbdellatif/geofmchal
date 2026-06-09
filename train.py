@@ -159,6 +159,11 @@ def parse_args():
                              "(GradScale-protected), mirror of the height bridge. Default off.")
     parser.add_argument("--fraction-bridge-alpha", type=float, default=0.2,
                         help="[7A Phase 5E #1] GradScale alpha for the fraction bridge. Default 0.2.")
+    parser.add_argument("--height-bridge-alpha", type=float, default=0.2,
+                        help="[Phase 10] GradScale alpha on the alpha(optical)->height-decoder "
+                             "bridge: fraction of the height-loss gradient that reaches the alpha "
+                             "encoder. Default 0.2 (byte-identical). Raise (0.5/1.0) to let the "
+                             "optical encoder contribute more to height (watch IoU_B for the cost).")
     parser.add_argument("--task", type=str, default="all", choices=["all", "fraction", "height"],
                         help="[7A Phase 8 P4] Train all tasks (default), or a single task: "
                              "'fraction' = fraction+binary only (drops height loss); "
@@ -698,6 +703,7 @@ def train_7a(args):
         f.write(f"PATCH_ROUTING: {args.patch_routing}\n")
         f.write(f"USE_FRACTION_BRIDGE: {args.use_fraction_bridge}\n")
         f.write(f"FRACTION_BRIDGE_ALPHA: {args.fraction_bridge_alpha}\n")
+        f.write(f"HEIGHT_BRIDGE_ALPHA: {args.height_bridge_alpha}\n")
         f.write(f"STATIC_WEIGHTS: {args.static_weights}\n")
         f.write(f"NO_HEIGHT_BRIDGE: {args.no_height_bridge}\n")
         f.write(f"NO_BINARY_HEAD: {args.no_binary_head}\n")
@@ -761,7 +767,8 @@ def train_7a(args):
                            patch_routing=args.patch_routing,
                            use_fraction_bridge=args.use_fraction_bridge,
                            fraction_bridge_alpha=args.fraction_bridge_alpha,
-                           fraction_head=args.fraction_head)
+                           fraction_head=args.fraction_head,
+                           bridge_alpha=args.height_bridge_alpha)
     model = model.to(device)
     print(f"   >> params: {sum(p.numel() for p in model.parameters())/1e6:.2f}M"
           f"  (height_bridge={'off' if args.no_height_bridge else 'on'})")

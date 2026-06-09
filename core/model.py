@@ -342,7 +342,7 @@ def build_model(model_type, n_channels, n_classes, use_height_bridge=True,
                 patch_stem_version="v2", xattn_heads=4,
                 patch_routing="sensor",
                 use_fraction_bridge=False, fraction_bridge_alpha=0.2,
-                fraction_head="sigmoid3"):
+                fraction_head="sigmoid3", bridge_alpha=0.2):
     selected = model_type.lower()
 
     if selected == "auto":
@@ -355,6 +355,7 @@ def build_model(model_type, n_channels, n_classes, use_height_bridge=True,
         # 7A: channels are fixed per modality (alpha=64, tessera=128, patches=768,
         # out=4). n_channels / n_classes are ignored for this architecture.
         return DualEncDualDecFusion(
+            bridge_alpha=bridge_alpha,
             use_height_bridge=use_height_bridge,
             patch_inputs=patch_inputs,
             patch_stem_version=patch_stem_version,

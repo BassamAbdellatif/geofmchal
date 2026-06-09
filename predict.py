@@ -584,6 +584,7 @@ def predict_7a(args, exp_dir, params):
     patch_routing = params.get("PATCH_ROUTING", "sensor").strip()
     use_fraction_bridge = params.get("USE_FRACTION_BRIDGE", "False").strip().lower() == "true"
     fraction_bridge_alpha = float(params.get("FRACTION_BRIDGE_ALPHA", "0.2"))
+    height_bridge_alpha = float(params.get("HEIGHT_BRIDGE_ALPHA", "0.2"))
     fraction_head = params.get("FRACTION_HEAD", "sigmoid3").strip()
     use_thor = any(p.startswith("thor") for p in patch_names)
 
@@ -595,7 +596,8 @@ def predict_7a(args, exp_dir, params):
                            patch_routing=patch_routing,
                            use_fraction_bridge=use_fraction_bridge,
                            fraction_bridge_alpha=fraction_bridge_alpha,
-                           fraction_head=fraction_head)
+                           fraction_head=fraction_head,
+                           bridge_alpha=height_bridge_alpha)
     model = model.to(device)
     state = torch.load(model_path, map_location=device)
     state = _remap_legacy_7a_state_dict(state, model)
