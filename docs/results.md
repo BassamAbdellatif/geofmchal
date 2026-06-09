@@ -598,3 +598,53 @@ measures extrapolation to an unseen region (mimics the test) and, averaged over 
 all variants" as held-out. "Use all data" is a *training* concern, satisfied by training the final
 model on all folds — not a reason to leak the validation. (Buffered/blocked CV is the only stronger
 option but adds code; plain geo multi-fold is the faithful, simpler choice.)
+
+---
+
+## Phase 9 — Building-Objective Multi-Fold Campaign (2026-06-09) — POSITIVE (sm4tv transfers)
+
+3 arms × 3 geo-folds, 40 epochs, seed 0, `--amp`, last-10-epoch-mean IoU. Arms vs `7A_v1_base`:
+`tversky` = `--building-overlap tversky 0.3/0.7` (P1); `sm4tv` = `+ --fraction-head softmax4` (P1+P2).
+
+### Full matrix (last-10-mean)
+| run | IoU_B | IoU_V | IoU_W |
+|-----|-------|-------|-------|
+| anchor_f0 | 0.1870 | 0.8080 | 0.6839 |
+| tversky_f0 | 0.2355 | 0.8043 | 0.6840 |
+| sm4tv_f0 | **0.2425** | 0.8056 | 0.6936 |
+| anchor_f1 | 0.2533 | 0.7499 | 0.6724 |
+| tversky_f1 | 0.2558 | 0.7483 | 0.6006 |
+| sm4tv_f1 | **0.2625** | 0.7497 | 0.6289 |
+| anchor_f2 | 0.1950 | 0.7847 | 0.6843 |
+| tversky_f2 | 0.2175 | 0.7849 | 0.6971 |
+| sm4tv_f2 | **0.2267** | 0.7923 | 0.6927 |
+
+### 32. The building-objective redesign (P1+P2) lifts IoU_B and TRANSFERS across regions
+Δ IoU_B vs each fold's anchor — **tversky** +0.049 / +0.003 / +0.023 (mean +0.025); **sm4tv**
++0.056 / +0.009 / +0.032 (mean **+0.032**). Δ IoU_W — tversky +0.000 / −0.072 / +0.013;
+**sm4tv** +0.010 / −0.044 / +0.008.
+
+- **It's a recall mechanism, not fold-0 overfit.** The lift is large in *hard*-building regions
+  (fold0/fold2, anchor IoU_B ~0.19 → +0.05/+0.03) and ~flat in the *easy* region (fold1, anchor
+  0.25, no recall headroom). Confirmation on fold2 (a third independent geo-fold) is the cross-fold
+  proof finding-29 demanded — this **generalizes** (contrast 7A's water, which did not).
+- **`sm4tv` (P1+P2) > `tversky` (P1) on both axes** — bigger IoU_B every fold *and* half the water
+  cost. The derived "others" softmax channel sharpens buildings and partially protects rare classes.
+  (Retires the earlier "softmax robs water" worry — that was a transient early-epoch dip; at
+  convergence sm4tv water = anchor or higher on fold0/fold2.)
+- **Only downside: fold-1 IoU_W** (sm4tv −0.044, tversky −0.072) — region-specific, not systemic.
+- **Honest size:** net proxy gain ~+0.007 mean (0.25·ΔB + 0.15·ΔW), clearly positive on the hard
+  folds, ~0 on the easy one. A real, transferable IoU_B improvement that rarely hurts — **not** a
+  top-3 breakthrough alone; it pairs with the height-cliff fix (hybrid 2A height) for a leaderboard
+  move.
+
+**Recipe to carry forward:** `--fraction-head softmax4 --building-overlap tversky --tversky-alpha
+0.3 --tversky-beta 0.7`. **Watch-item:** confirm fold-1's water dip doesn't hurt IoU_W on the
+platform region.
+
+### Forward plan
+1. Train the **sm4tv** recipe on **all 5 folds** (no holdout) → final building/fraction model.
+2. **Hybrid**: graft 2A_vegboost's sub-3.9 m height onto sm4tv's fraction/building channels (clears
+   the RMSE_V cliff that caps standalone 7A — f29/cliff note).
+3. Submit the hybrid; compare platform IoU_B/IoU_W vs `2A_vegboost` 0.3721. Optional confirm arms:
+   gentler tversky 0.4/0.6 if the fold-1 water cost looks load-bearing on the platform.
