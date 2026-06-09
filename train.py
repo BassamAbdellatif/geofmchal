@@ -715,14 +715,23 @@ def train_7a(args):
         f.write(f"OPTIMIZER: AdamW lr={LEARNING_RATE} wd={WEIGHT_DECAY}\n")
 
     print("--- 7A Data Setup ---")
+    # [no-holdout] cv_fold < 0 -> train on ALL tiles, no validation (final
+    # submission model). The split logic already yields train=all (no fold == -1)
+    # and val=empty; we just skip building/using the empty val set.
+    no_holdout = args.cv_fold < 0
     tiles = find_multimodal_train_tiles(DATA_ROOT_7A, use_thor=use_thor)
     train_ds = GeoFMDataset7A(tiles, is_train=True, cv_fold=args.cv_fold,
                               cache_dir=args.cache_dir, rebuild_cache=args.rebuild_cache,
                               patch_inputs=patch_names)
-    val_ds = GeoFMDataset7A(tiles, is_train=False, cv_fold=args.cv_fold,
-                            cache_dir=args.cache_dir, rebuild_cache=args.rebuild_cache,
-                            patch_inputs=patch_names)
-    print(f"   >> matched={len(tiles)}  train={len(train_ds)}  val={len(val_ds)}  (cv_fold={args.cv_fold})")
+    if no_holdout:
+        val_ds = None
+        print(f"   >> matched={len(tiles)}  train={len(train_ds)}  val=0  "
+              f"(NO-HOLDOUT: training on ALL tiles, cv_fold={args.cv_fold})")
+    else:
+        val_ds = GeoFMDataset7A(tiles, is_train=False, cv_fold=args.cv_fold,
+                                cache_dir=args.cache_dir, rebuild_cache=args.rebuild_cache,
+                                patch_inputs=patch_names)
+        print(f"   >> matched={len(tiles)}  train={len(train_ds)}  val={len(val_ds)}  (cv_fold={args.cv_fold})")
 
     if args.use_stratified_sampler:
         _strata = [float(x) for x in args.strata_weights.split(",")]
@@ -738,7 +747,7 @@ def train_7a(args):
         num_workers=args.num_workers, pin_memory=True, drop_last=True,
         worker_init_fn=worker_init_fn,
     )
-    val_loader = DataLoader(
+    val_loader = None if no_holdout else DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, pin_memory=True,
     )
@@ -837,38 +846,55 @@ def train_7a(args):
         train_hist.append(epoch_loss)
         ep_task = {k: v / max(1, seen) for k, v in ep_task.items()}
 
-        metrics = evaluate_7a(model, val_loader, criterion, device, amp=args.amp,
-                              fraction_head=args.fraction_head)
-        proxy_hist.append(metrics["proxy"])
-
-        if metrics["proxy"] > best_proxy:
-            best_proxy = metrics["proxy"]
-            torch.save(model.state_dict(), best_path)
-            tag = "  *** new best ***"
-        else:
-            tag = ""
-
         gn_str = ""
         if use_gn:
             wd = balancer.weight_dict()
             gn_str = "  w[f/h/b]=%.2f/%.2f/%.2f" % (
                 wd["fraction"], wd["height"], wd.get("binary", 0.0))
-        print(f"Epoch {epoch+1}/{args.epochs} | train {epoch_loss:.4f} | "
-              f"proxy {metrics['proxy']:.4f} | IoU B/V/W {metrics['iou_b']:.3f}/"
-              f"{metrics['iou_v']:.3f}/{metrics['iou_w']:.3f} | RMSE B/V "
-              f"{metrics['rmse_b']:.2f}/{metrics['rmse_v']:.2f}m{gn_str}{tag}")
-        with open(cfg_path, "a") as f:
-            f.write(f"Epoch {epoch+1}: train={epoch_loss:.4f} proxy={metrics['proxy']:.4f} "
-                    f"IoU_B={metrics['iou_b']:.4f} IoU_V={metrics['iou_v']:.4f} "
-                    f"IoU_W={metrics['iou_w']:.4f} RMSE_B={metrics['rmse_b']:.3f} "
-                    f"RMSE_V={metrics['rmse_v']:.3f} task_train={ep_task} "
-                    f"val_task={metrics['val_task_losses']}{gn_str}\n")
+
+        if no_holdout:
+            # No validation set: save the current model every epoch (the final
+            # model is the last epoch) and log train loss only.
+            proxy_hist.append(epoch_loss)
+            torch.save(model.state_dict(), best_path)   # = latest; predict.py loads model_best
+            print(f"Epoch {epoch+1}/{args.epochs} | train {epoch_loss:.4f} | "
+                  f"(no-holdout, saved){gn_str}")
+            with open(cfg_path, "a") as f:
+                f.write(f"Epoch {epoch+1}: train={epoch_loss:.4f} (no-holdout) "
+                        f"task_train={ep_task}{gn_str}\n")
+        else:
+            metrics = evaluate_7a(model, val_loader, criterion, device, amp=args.amp,
+                                  fraction_head=args.fraction_head)
+            proxy_hist.append(metrics["proxy"])
+
+            if metrics["proxy"] > best_proxy:
+                best_proxy = metrics["proxy"]
+                torch.save(model.state_dict(), best_path)
+                tag = "  *** new best ***"
+            else:
+                tag = ""
+
+            print(f"Epoch {epoch+1}/{args.epochs} | train {epoch_loss:.4f} | "
+                  f"proxy {metrics['proxy']:.4f} | IoU B/V/W {metrics['iou_b']:.3f}/"
+                  f"{metrics['iou_v']:.3f}/{metrics['iou_w']:.3f} | RMSE B/V "
+                  f"{metrics['rmse_b']:.2f}/{metrics['rmse_v']:.2f}m{gn_str}{tag}")
+            with open(cfg_path, "a") as f:
+                f.write(f"Epoch {epoch+1}: train={epoch_loss:.4f} proxy={metrics['proxy']:.4f} "
+                        f"IoU_B={metrics['iou_b']:.4f} IoU_V={metrics['iou_v']:.4f} "
+                        f"IoU_W={metrics['iou_w']:.4f} RMSE_B={metrics['rmse_b']:.3f} "
+                        f"RMSE_V={metrics['rmse_v']:.3f} task_train={ep_task} "
+                        f"val_task={metrics['val_task_losses']}{gn_str}\n")
 
     torch.save(model.state_dict(), last_path)
     total_min = (time.time() - total_start) / 60
-    print(f"\n=== 7A DONE === best proxy={best_proxy:.4f}  total={total_min:.1f}m")
+    summary = (f"final train loss={train_hist[-1]:.4f} (no-holdout)" if no_holdout
+               else f"best proxy={best_proxy:.4f}")
+    print(f"\n=== 7A DONE === {summary}  total={total_min:.1f}m")
     with open(cfg_path, "a") as f:
-        f.write(f"BEST_PROXY: {best_proxy:.4f}\nTOTAL_MIN: {total_min:.1f}\n")
+        if no_holdout:
+            f.write(f"NO_HOLDOUT: True\nFINAL_TRAIN_LOSS: {train_hist[-1]:.4f}\nTOTAL_MIN: {total_min:.1f}\n")
+        else:
+            f.write(f"BEST_PROXY: {best_proxy:.4f}\nTOTAL_MIN: {total_min:.1f}\n")
 
     try:
         plt.figure()
