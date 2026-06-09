@@ -291,7 +291,7 @@ def main():
     model_type = params.get("MODEL_TYPE", "decoder_residual").lower()
 
     # 7A dispatch: fully self-contained inference path.
-    if model_type == "dual_enc_dec_fusion":
+    if model_type in ("dual_enc_dec_fusion", "fresh_extract"):
         return predict_7a(args, exp_dir, params)
 
     # CLI args take priority; fall back to training_params.txt; empty string triggers fallback parser below
@@ -586,9 +586,11 @@ def predict_7a(args, exp_dir, params):
     fraction_bridge_alpha = float(params.get("FRACTION_BRIDGE_ALPHA", "0.2"))
     height_bridge_alpha = float(params.get("HEIGHT_BRIDGE_ALPHA", "0.2"))
     fraction_head = params.get("FRACTION_HEAD", "sigmoid3").strip()
+    model_type = params.get("MODEL_TYPE", "dual_enc_dec_fusion").strip()
+    use_terramind = params.get("USE_TERRAMIND", "True").strip().lower() != "false"
     use_thor = any(p.startswith("thor") for p in patch_names)
 
-    model, _ = build_model("dual_enc_dec_fusion", n_channels=64, n_classes=4,
+    model, _ = build_model(model_type, n_channels=64, n_classes=4,
                            use_height_bridge=use_height_bridge,
                            patch_inputs=patch_names,
                            patch_stem_version=patch_stem_version,
@@ -597,7 +599,8 @@ def predict_7a(args, exp_dir, params):
                            use_fraction_bridge=use_fraction_bridge,
                            fraction_bridge_alpha=fraction_bridge_alpha,
                            fraction_head=fraction_head,
-                           bridge_alpha=height_bridge_alpha)
+                           bridge_alpha=height_bridge_alpha,
+                           use_terramind=use_terramind)
     model = model.to(device)
     state = torch.load(model_path, map_location=device)
     state = _remap_legacy_7a_state_dict(state, model)

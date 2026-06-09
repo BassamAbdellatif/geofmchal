@@ -342,7 +342,7 @@ def build_model(model_type, n_channels, n_classes, use_height_bridge=True,
                 patch_stem_version="v2", xattn_heads=4,
                 patch_routing="sensor",
                 use_fraction_bridge=False, fraction_bridge_alpha=0.2,
-                fraction_head="sigmoid3", bridge_alpha=0.2):
+                fraction_head="sigmoid3", bridge_alpha=0.2, use_terramind=True):
     selected = model_type.lower()
 
     if selected == "auto":
@@ -364,6 +364,13 @@ def build_model(model_type, n_channels, n_classes, use_height_bridge=True,
             use_fraction_bridge=use_fraction_bridge,
             fraction_bridge_alpha=fraction_bridge_alpha,
             fraction_head=fraction_head,
+        ), selected
+    if selected == "fresh_extract":
+        return FreshExtract(
+            patch_inputs=patch_inputs,
+            fraction_head=fraction_head,
+            use_terramind=use_terramind,
+            patch_stem_version=patch_stem_version,
         ), selected
 
     raise ValueError(
@@ -860,3 +867,126 @@ class DualEncDualDecFusion(nn.Module):
         else:
             frac = torch.sigmoid(out["fraction"])
         return torch.cat([frac, out["height"]], dim=1)   # (B,4,256,256)
+
+
+# ===================================================================================
+# Phase 11 — FreshExtract (design: docs/phase11_fresh_architecture.md)
+# ===================================================================================
+class _EncStage(nn.Module):
+    """One encoder stage: stride-2 downsample DoubleConv + a refine DoubleConv (deeper)."""
+
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.down = _DoubleConvGN(in_ch, out_ch, stride=2)
+        self.refine = _DoubleConvGN(out_ch, out_ch)
+
+    def forward(self, x):
+        return self.refine(self.down(x))
+
+
+class _DeepEncoder(nn.Module):
+    """stem_out (c0 @ 256) -> 5-level pyramid [c0@256, c1@128, c2@64, c3@32, c4@16]."""
+
+    def __init__(self, c):
+        super().__init__()
+        self.s1 = _EncStage(c[0], c[1])
+        self.s2 = _EncStage(c[1], c[2])
+        self.s3 = _EncStage(c[2], c[3])
+        self.s4 = _EncStage(c[3], c[4])
+
+    def forward(self, x0):
+        x1 = self.s1(x0); x2 = self.s2(x1); x3 = self.s3(x2); x4 = self.s4(x3)
+        return [x0, x1, x2, x3, x4]
+
+
+class _PyrDecoder(nn.Module):
+    """Consume a fused pyramid [c0@256, c1@128, c2@64, c3@32, c4@16] -> c0 @ 256."""
+
+    def __init__(self, c):
+        super().__init__()
+        self.up1 = _UpBlock(c[4], c[3], c[3])   # 16 -> 32
+        self.up2 = _UpBlock(c[3], c[2], c[2])   # 32 -> 64
+        self.up3 = _UpBlock(c[2], c[1], c[1])   # 64 -> 128
+        self.up4 = _UpBlock(c[1], c[0], c[0])   # 128 -> 256
+
+    def forward(self, pyr):
+        x = self.up1(pyr[4], pyr[3])
+        x = self.up2(x, pyr[2])
+        x = self.up3(x, pyr[1])
+        x = self.up4(x, pyr[0])
+        return x
+
+
+class FreshExtract(nn.Module):
+    """
+    Deep dual pixel encoders (alpha 64@256, tessera 128@256) at full resolution, with
+    SYMMETRIC per-level fusion into one shared feature pyramid fed to BOTH decoders — so
+    the height head sees AlphaEarth's LiDAR/DEM signal fully (Bet 1), not a throttled
+    side-input. Wider+deeper than 7A (Bet 2). TerraMind 16×16 tokens optionally injected
+    at the two coarsest levels (Bet 3; toggle via use_terramind).
+
+    forward(batch{alpha_earth, tessera, [terramind_s1, terramind_s2]}) ->
+        {fraction (B,3|4,256,256), height (B,1,256,256), binary (B,1,256,256)}
+    """
+    CHANNELS = [96, 160, 256, 384, 512]   # @ [256,128,64,32,16]
+
+    def __init__(self, patch_inputs=("terramind_s1", "terramind_s2"),
+                 fraction_head="softmax4", use_terramind=True, patch_stem_version="v1"):
+        super().__init__()
+        c = self.CHANNELS
+        self.fraction_head = fraction_head
+        self.use_terramind = use_terramind
+        self.patch_inputs = list(patch_inputs)
+        self.alpha_stem = _ModalityStem(64, c[0])
+        self.tessera_stem = _ModalityStem(128, c[0])
+        self.alpha_enc = _DeepEncoder(c)
+        self.tessera_enc = _DeepEncoder(c)
+        self.fuse = nn.ModuleList([nn.Conv2d(2 * c[l], c[l], 1, bias=False) for l in range(5)])
+        if use_terramind and self.patch_inputs:
+            self.tok_stems = nn.ModuleDict(
+                {n: _make_patch_stem(patch_stem_version, 768, c[4]) for n in self.patch_inputs})
+            self.tok_to_l3 = nn.Conv2d(c[4], c[3], 1, bias=False)
+        self.fraction_decoder = _PyrDecoder(c)
+        self.height_decoder = _PyrDecoder(c)
+        nfrac = 4 if fraction_head == "softmax4" else 3
+        self.frac_head = nn.Conv2d(c[0], nfrac, 1)
+        self.binary_head = nn.Conv2d(c[0], 1, 1)
+        self.height_head = nn.Conv2d(c[0], 1, 1)
+
+    def _tokens_16(self, batch):
+        grids = []
+        for n in self.patch_inputs:
+            if n in batch:
+                t = self.tok_stems[n](batch[n])                  # (B,256,c4)
+                B = t.shape[0]
+                grids.append(t.transpose(1, 2).reshape(B, -1, 16, 16))
+        if not grids:
+            return None
+        return sum(grids) / len(grids)                           # (B,c4,16,16)
+
+    def forward(self, batch):
+        a0 = self.alpha_stem(batch["alpha_earth"])
+        t0 = self.tessera_stem(batch["tessera"])
+        aP = self.alpha_enc(a0)
+        tP = self.tessera_enc(t0)
+        pyr = [self.fuse[l](torch.cat([aP[l], tP[l]], dim=1)) for l in range(5)]
+        if self.use_terramind and self.patch_inputs:
+            tok = self._tokens_16(batch)
+            if tok is not None:
+                pyr[4] = pyr[4] + tok
+                up = F.interpolate(tok, size=pyr[3].shape[-2:], mode="bilinear", align_corners=False)
+                pyr[3] = pyr[3] + self.tok_to_l3(up)
+        ffeat = self.fraction_decoder(pyr)
+        hfeat = self.height_decoder(pyr)
+        return {"fraction": self.frac_head(ffeat),
+                "height": self.height_head(hfeat),
+                "binary": self.binary_head(ffeat)}
+
+    @torch.no_grad()
+    def predict(self, batch):
+        out = self.forward(batch)
+        if self.fraction_head == "softmax4":
+            frac = torch.softmax(out["fraction"], dim=1)[:, :3]
+        else:
+            frac = torch.sigmoid(out["fraction"])
+        return torch.cat([frac, out["height"]], dim=1)
