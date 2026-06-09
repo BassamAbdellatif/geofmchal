@@ -84,3 +84,23 @@ objectives + domain robustness, not architecture). If P1+P2 lands even half the 
 plausible and top-3 is in play with P3/P4/P5 stacked. If it doesn't move, the ceiling is structural
 (resolution/features) and top-3 is unlikely in 21 days — we'd optimise for best-honest-rank instead.
 **P0 tells us early which world we're in.**
+
+---
+
+## STATUS UPDATE — 2026-06-10 (which world we're in)
+
+We're in the harder world. Outcome of the plan above (detail: `results.md` f29–f34):
+- **P0/anchor + P1+P2 done:** sm4tv (softmax4+tversky) **transferred** (+IoU_B across 3 geo-folds) →
+  `9_sm4tv_final_hybrid` (sm4tv fractions + 2A height) = **0.3871, our best submission**.
+- **But rank 54** — the field moved to 0.48–0.54; a +0.015 gain *lost* ground.
+- **Incremental tuning is exhausted:** Phase 8 null, Phase 9 small, **Phase 10 (gradient/bridge) null**
+  (f33). The 7A architecture is capped (IoU_B ~0.24 / RMSE_V ~4.0 internal).
+- **Decode-resolution audit (f34): the decoder is already full-res** → the "raise resolution / light
+  U-Net" lever is *not available*; the gap is input-embedding scale (~10 m) + extraction/capacity.
+- **Scoring is ~linear, no hard cliff** (corrected): height (RMSE) is our biggest, most under-invested
+  deficit, lost *continuously* vs the field's ~3.0 m.
+
+**Fork (pending user decision):** (a) consolidate the 0.3871 best; or (b) a capacity/height swing
+(heavier decoder / multi-seed ensemble / a dedicated better height model) — uncertain, top-3 out of
+reach in the remaining days. P1 (gradient), P3a (sampling), P2/P3b: closed-negative. Calibration/TTA:
+excluded (TTA hurts; calibration won't transfer).

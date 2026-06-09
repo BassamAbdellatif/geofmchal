@@ -17,16 +17,18 @@ score = 0.25×IoU_B + 0.15×IoU_V + 0.15×IoU_W
 - IoU is hard binary at threshold 0.5 on abundance predictions.
 - The proxy in train.py uses C=4.0 (close enough; do not change without rerunning all proxy comparisons).
 
-## Our Current Platform Metrics (best submission: `2A_vegboost`)
-| Metric   | Us     | Top team | Gap (score) | Priority |
-|----------|--------|----------|-------------|----------|
-| IoU_B    | 0.3394 | 0.5269   | −0.047      | **1st**  |
-| IoU_V    | 0.7649 | 0.8221   | −0.009      | low      |
-| IoU_W    | 0.3695 | 0.5194   | −0.022      | 2nd      |
-| RMSE_B   | 2.27m  | 1.76m    | −0.033      | 3rd      |
-| RMSE_V   | 3.74m  | 3.06m    | −0.034      | 4th      |
+## Our Current Platform Metrics (best submission: `9_sm4tv_final_hybrid` = 0.3871, rank 54 — 2026-06-10)
+| Metric   | Us (hybrid) | #1 DisasterM3 | #10 cutoff | Gap-to-#10 (score) |
+|----------|-------------|---------------|------------|--------------------|
+| final    | 0.3871      | 0.5448        | ~0.478     | −0.091             |
+| IoU_B    | 0.3511      | 0.5316        | 0.485      | −0.034             |
+| IoU_V    | 0.7949      | 0.8924        | 0.804      | ~0                 |
+| IoU_W    | 0.4544      | 0.6141        | 0.509      | −0.008             |
+| RMSE_B   | 2.28m       | 1.83m         | 1.90m      | −0.024             |
+| RMSE_V   | 3.70m       | 2.78m         | 3.30m      | −0.020             |
 
-> Priority revised after the 6A post-mortem: IoU_B is the largest score gap and represents a *representation* problem (we cannot extract clean building signal), not a calibration problem. The 7A plan addresses this directly.
+> **State (2026-06-10):** best = `9_sm4tv_final_hybrid` (sm4tv softmax4+tversky fractions + 2A height) = **0.3871** but **rank 54** — the field moved to 0.48–0.54. **Scoring ≈ our C=4 proxy (no hard cliff; height lost continuously).** Biggest deficits: **IoU_B *and* RMSE (height) — combined RMSE gap (−0.044) is our largest and most under-invested.** Top teams beat us on every metric → capability gap, not a tweak.
+> **Incremental tuning is exhausted** (Phase 8 null / Phase 9 small / Phase 10 gradient-bridge null, f33) and the **decoder is already full-resolution** (f34) — so the "raise-resolution / light-U-Net" lever is not available. Remaining step-change candidates (capacity/ensemble/better-height) are uncertain; **top-3 is out of reach in the remaining days.** Full detail: `docs/results.md` f29–f34, `docs/roadmap_final21d.md` status update.
 
 ## Task Description (critical)
 - Targets are **abundance fractions** (0–1), computed from 1m-resolution binary masks
