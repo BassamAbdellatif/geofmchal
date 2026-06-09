@@ -9,19 +9,24 @@
 | 5/26 | `2A_alpha…_tta` | 0.3369 | 0.3197 | 0.7539 | 0.3878 | 2.409 | 4.087 | **TTA** | TTA *hurt*: RMSE_V 3.74→4.09 crossed cliff (−0.029) |
 | 5/28 | **`2A_vegboost`** | **0.3721** | 0.3331 | 0.7642 | 0.4154 | 2.279 | 3.704 | raw | **current best**; under cliff |
 | 6/1  | `7A_geocv_baseline_tta` | 0.3575 | 0.3403 | 0.7981 | 0.4138 | 2.348 | 4.093 | TTA+blend+thresh | over cliff |
-| 6/8  | `7A_v1_base` | 0.3392 | 0.3263 | 0.7915 | 0.3602 | 2.401 | 4.128 | raw | over cliff; water collapsed (see f29) |
+| 6/8  | `7A_v1_base` | 0.3392 | 0.3263 | 0.7915 | 0.3602 | 2.401 | 4.128 | raw | water collapsed on transfer (f29) |
+| 6/9  | **`9_sm4tv_final_hybrid`** | **0.3871** | 0.3511 | 0.7949 | 0.4544 | 2.279 | 3.704 | hybrid (sm4tv B/V/W + 2A height) | **new best**; rank 54 |
 
-> **Current best platform score: 0.3721 (`2A_vegboost`, raw, 5/28).**
-> **Two corrected lessons (supersede earlier notes):**
-> 1. **TTA is unsafe here** — it smears the height regression and pushed `2A_alpha` RMSE_V 3.74→4.09
->    over the 3.9 m cliff, costing −0.029 (0.366→0.337). Do not use TTA unless comfortably under cliff.
-> 2. **7A is NOT architecturally superior on the platform** (earlier claim retracted). Its internal
->    IoU_W/IoU_B leads are largely fold-0 overfit and do **not** transfer (finding 29). On the platform
->    7A_v1_base IoU_B (0.326) is *below* 2A_vegboost (0.333); its only honest edge is IoU_V.
-> The RMSE_V < 3.9 m cliff is the dominant aggregate-score lever: every strong submission clears it;
-> every 7A run is stuck at ~4.1 (forfeits the 20% height term). 7A floors at ~4.0 m standalone → a
-> **hybrid** (7A fractions + sub-cliff height) is the near-term path above 0.372.
-> 6A family produced nothing submission-worthy — proxy 0.24 max vs 2A's 0.37.
+> **Current best: 0.3871 (`9_sm4tv_final_hybrid`, 6/9) — but still rank 54** (field is at 0.48–0.54).
+> The hybrid worked: sm4tv's building lift *transferred* (IoU_B 0.326→0.351, above 2A's 0.333) and 2A's
+> height gave RMSE_V 3.70.
+>
+> **Scoring formula (reverse-engineered from the hybrid-vs-2A delta, matches to ~0.001):**
+> `final ≈ 0.25·IoU_B + 0.15·IoU_V + 0.15·IoU_W + 0.25·(1−RMSE_B/4) + 0.20·(1−RMSE_V/4)` — i.e. ≈ our
+> internal C=4 proxy. **CORRECTION to the earlier "3.9 m cliff" framing (f21/science.md): there is NO
+> hard cliff** — RMSE credit is ~linear, so height is lost *continuously*. Top teams at RMSE_V ~2.8–3.0
+> bank far more height credit than us at 3.70 — a graded deficit, not a binary threshold.
+>
+> **Where we lose vs top-10 (Cisco 0.478; our 0.387 → ~0.09 gap):** IoU_B −0.13 (≈ −0.034 score),
+> **RMSE_B + RMSE_V combined ≈ −0.044 (our *largest*, most under-invested deficit)**, IoU_W −0.055
+> (≈ −0.008), IoU_V ~flat. Top teams beat us on *every* metric → a model-capability gap, not a tweak.
+> **Lessons that stand:** TTA is unsafe (smears height → +RMSE); 7A's internal IoU leads are largely
+> fold-0 overfit (f29); 6A family produced nothing submission-worthy (proxy 0.24 max).
 
 **Leaderboard snapshot (as of 2026-06-01) — top 8 teams:**
 
@@ -648,3 +653,53 @@ platform region.
    the RMSE_V cliff that caps standalone 7A — f29/cliff note).
 3. Submit the hybrid; compare platform IoU_B/IoU_W vs `2A_vegboost` 0.3721. Optional confirm arms:
    gentler tversky 0.4/0.6 if the fold-1 water cost looks load-bearing on the platform.
+
+**Outcome:** done — `9_sm4tv_final` (all-folds no-holdout) + `hybrid_merge.py` (graft 2A height) →
+`9_sm4tv_final_hybrid` = **0.3871, our best** (but rank 54; the field moved). New code: `--cv-fold -1`
+no-holdout mode, `--scratch-dir` (NVMe I/O), `hybrid_merge.py`, `--height-bridge-alpha`.
+
+---
+
+## Phase 10 — Cross-encoder gradient / bridge sweep (2026-06-10) — NEGATIVE (null)
+
+Motivation: height (RMSE_V) is our largest leaderboard deficit; the alpha(optical)→height bridge is
+GradScale-throttled to α=0.2, so maybe the optical encoder is under-used for height. Swept the
+height-bridge α and the tessera→fraction bridge on the sm4tv recipe, fold 0 (last-10-mean):
+
+| arm | α (opt→height) | IoU_B | IoU_W | RMSE_B | RMSE_V |
+|-----|----------------|-------|-------|--------|--------|
+| `sm4tv_f0` (control) | 0.2 | 0.2425 | 0.6936 | 2.098 | 4.044 |
+| `10_ha05_f0` | 0.5 | 0.2372 | 0.6907 | 2.097 | 4.035 |
+| `10_ha10_f0` | 1.0 | 0.2427 | 0.6927 | 2.100 | 4.065 |
+| `10_fbr_f0` | 0.2 + tessera→fraction bridge | 0.2375 | 0.6952 | 2.129 | 4.121 |
+
+### 33. Cross-encoder gradient/bridge tuning does NOT move height or buildings — null
+**RMSE_V is flat across α** (4.044 → 4.035 → 4.065): feeding the optical encoder more height-gradient
+does nothing for height. **Hypothesis falsified** — our height ceiling is *not* a gradient-routing
+problem. IoU_B also flat (~0.24); the tessera→fraction bridge slightly *hurt* (RMSE_V 4.12, IoU_B
+0.238). Combining best-α + fraction-bridge would not give a step (two null/negative levers don't
+synergise). Extends f26: the multi-task *plumbing* is not a lever. **Incremental tuning is exhausted**
+— Phase 8 (interference/sampling) null, Phase 9 (objective) small-positive, Phase 10 (gradient/bridge)
+null. The 7A architecture is capped at IoU_B ~0.24 / RMSE_V ~4.0 internally.
+
+### 34. Decode-resolution audit — the decoder is NOT the bottleneck
+Traced the 7A decode path: stem 96ch@256 → encoder skips [96@256, 128@128, 192@64, 256@32] →
+bottleneck 384@16 → decoder upsamples 16→32→64→128→**256 with a skip at every level** (incl. the
+256-res L0 skip into the final block). So the decoder is **already full-resolution** — we are *not*
+bottlenecking through 16×16 or discarding fine detail. Therefore **"raise decode resolution" is not an
+available lever**, and a *lighter* U-Net (fewer params, same/!lower res) would not help buildings.
+The real limits: (a) **input embeddings are ~10 m-scale** (a building is ~1–3 px; the task is
+fractional abundance per coarse pixel, so it's an *extraction/regression-quality* problem, not edge
+sharpness); (b) **capacity/extraction vs the field** — top teams get IoU_B ~0.5 / RMSE_V ~3.0 from the
+*same* embeddings, so the info is there and we under-extract it. Closing that is a "much better/bigger
+model" gap, not a structural-resolution fix.
+
+### Phase 10 verdict & fork
+- **Incremental levers (objective/gradient/bridge/sampling) are exhausted.** No more α/bridge sweeps.
+- **Resolution is not the lever** (decoder already full-res) → the light-U-Net rebuild is *not*
+  justified on resolution grounds (and 6A's concat failure warns against it).
+- Remaining step-change candidates are all **capacity/extraction-side and uncertain in ~20 days**:
+  heavier decoder, multi-seed ensemble of sm4tv, or a dedicated better *height* sub-model (ours ~4.0
+  lags even simple 2A's 3.70). 
+- **Honest position:** top-3 (+0.12) is out of reach; the realistic choice is (a) consolidate the
+  0.3871 best, or (b) a capacity/height swing knowing it's a long shot. Pending decision.
