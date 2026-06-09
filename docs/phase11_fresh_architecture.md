@@ -36,7 +36,10 @@ All 10 m ground resolution; a 256×256 tile = 2.56 km (a building ≈ 1–3 px; 
 | target | 4 × 256×256 | building/veg/water fractions + normalised height (÷30) |
 
 ## 3. Goals
-- **Single, reproducible model** — make the model's *own* height good (drop the 2A height graft).
+- **Single, reproducible model — DECISION LOCKED (2026-06-10):** the fresh model produces all 4
+  channels itself, including height. **No 2A height graft / no 2-model hybrid.** (Ensembling the final
+  winner across seeds is still allowed as an end-stage, orthogonal step.) Make the model's *own* height
+  good via Bet 1 (AlphaEarth→height).
 - Raise **IoU_B** and lower **RMSE_B/V**, without regressing IoU_W/V.
 - **Keep the Phase-9 objective win** (`softmax4` fraction head + Tversky 0.3/0.7 = "sm4tv").
 

@@ -123,7 +123,7 @@ def save_experiment_config(pixel_inputs=None, patch_inputs=None):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train emb2heights baseline models")
-    parser.add_argument("--model-type", type=str, default=MODEL_TYPE, choices=["auto", "lightunet", "decoder_residual", "attention_fusion", "dual_enc_dec_fusion"])
+    parser.add_argument("--model-type", type=str, default=MODEL_TYPE, choices=["auto", "lightunet", "decoder_residual", "attention_fusion", "dual_enc_dec_fusion", "fresh_extract"])
     parser.add_argument("--output-dir", type=str, default=BASE_DIR)
     parser.add_argument("--train-embeddings-dir", type=str, default=None, help="Path to training embeddings. Defaults to path in config.py based on model-type.")
     parser.add_argument("--train-targets-dir", type=str, default=None, help="Path to training targets. Defaults to path in config.py.")
@@ -159,6 +159,15 @@ def parse_args():
                              "(GradScale-protected), mirror of the height bridge. Default off.")
     parser.add_argument("--fraction-bridge-alpha", type=float, default=0.2,
                         help="[7A Phase 5E #1] GradScale alpha for the fraction bridge. Default 0.2.")
+    parser.add_argument("--train-folds", type=str, default=None,
+                        help="[Phase 11 fast-dev] Comma-separated geo-folds to TRAIN on (e.g. '0'). "
+                             "With --val-folds, overrides the cv_fold split for fast screening "
+                             "(train fold 0 / val fold 1 ≈ 5× faster). Default None = normal cv_fold.")
+    parser.add_argument("--val-folds", type=str, default=None,
+                        help="[Phase 11 fast-dev] Comma-separated geo-folds to VALIDATE on (e.g. '1').")
+    parser.add_argument("--use-terramind", action=argparse.BooleanOptionalAction, default=True,
+                        help="[Phase 11] fresh_extract: inject TerraMind tokens (default True). "
+                             "--no-use-terramind = pixel-only ablation (Bet 3b).")
     parser.add_argument("--height-bridge-alpha", type=float, default=0.2,
                         help="[Phase 10] GradScale alpha on the alpha(optical)->height-decoder "
                              "bridge: fraction of the height-loss gradient that reaches the alpha "
@@ -304,7 +313,8 @@ def main():
     EPOCHS = args.epochs
 
     # 7A dispatch: fully self-contained path; never touches the legacy branches.
-    if MODEL_TYPE == "dual_enc_dec_fusion":
+    # fresh_extract (Phase 11) shares the same data/loss/eval pipeline.
+    if MODEL_TYPE in ("dual_enc_dec_fusion", "fresh_extract"):
         return train_7a(args)
 
     # Resolve directories using config.py
@@ -687,7 +697,7 @@ def train_7a(args):
 
     with open(cfg_path, "w") as f:
         f.write(f"--- EXPERIMENT: {args.experiment_name} ---\n")
-        f.write("MODEL_TYPE: dual_enc_dec_fusion\n")
+        f.write(f"MODEL_TYPE: {args.model_type}\n")
         f.write(f"PATCH_SIZE: {args.patch_size}\n")
         f.write(f"BATCH_SIZE: {args.batch_size}\n")
         f.write(f"EPOCHS: {args.epochs}\n")
@@ -704,6 +714,9 @@ def train_7a(args):
         f.write(f"USE_FRACTION_BRIDGE: {args.use_fraction_bridge}\n")
         f.write(f"FRACTION_BRIDGE_ALPHA: {args.fraction_bridge_alpha}\n")
         f.write(f"HEIGHT_BRIDGE_ALPHA: {args.height_bridge_alpha}\n")
+        f.write(f"USE_TERRAMIND: {args.use_terramind}\n")
+        f.write(f"TRAIN_FOLDS: {args.train_folds}\n")
+        f.write(f"VAL_FOLDS: {args.val_folds}\n")
         f.write(f"STATIC_WEIGHTS: {args.static_weights}\n")
         f.write(f"NO_HEIGHT_BRIDGE: {args.no_height_bridge}\n")
         f.write(f"NO_BINARY_HEAD: {args.no_binary_head}\n")
@@ -725,11 +738,21 @@ def train_7a(args):
     # submission model). The split logic already yields train=all (no fold == -1)
     # and val=empty; we just skip building/using the empty val set.
     no_holdout = args.cv_fold < 0
+    fast = args.train_folds is not None  # [Phase 11] explicit fold-set screening
+    tr_inc = [int(x) for x in args.train_folds.split(",")] if args.train_folds else None
+    va_inc = [int(x) for x in args.val_folds.split(",")] if args.val_folds else None
     tiles = find_multimodal_train_tiles(DATA_ROOT_7A, use_thor=use_thor)
     train_ds = GeoFMDataset7A(tiles, is_train=True, cv_fold=args.cv_fold,
                               cache_dir=args.cache_dir, rebuild_cache=args.rebuild_cache,
-                              patch_inputs=patch_names)
-    if no_holdout:
+                              patch_inputs=patch_names, include_folds=tr_inc)
+    if fast:
+        val_ds = (GeoFMDataset7A(tiles, is_train=False, cache_dir=args.cache_dir,
+                                 rebuild_cache=args.rebuild_cache, patch_inputs=patch_names,
+                                 include_folds=va_inc) if va_inc else None)
+        no_holdout = (val_ds is None)
+        print(f"   >> FAST-DEV: train folds={tr_inc} ({len(train_ds)})  "
+              f"val folds={va_inc} ({len(val_ds) if val_ds else 0})")
+    elif no_holdout:
         val_ds = None
         print(f"   >> matched={len(tiles)}  train={len(train_ds)}  val=0  "
               f"(NO-HOLDOUT: training on ALL tiles, cv_fold={args.cv_fold})")
@@ -759,7 +782,7 @@ def train_7a(args):
     )
 
     print("--- 7A Model Init ---")
-    model, _ = build_model("dual_enc_dec_fusion", n_channels=64, n_classes=4,
+    model, _ = build_model(args.model_type, n_channels=64, n_classes=4,
                            use_height_bridge=not args.no_height_bridge,
                            patch_inputs=patch_names,
                            patch_stem_version=args.patch_stem_version,
@@ -768,7 +791,8 @@ def train_7a(args):
                            use_fraction_bridge=args.use_fraction_bridge,
                            fraction_bridge_alpha=args.fraction_bridge_alpha,
                            fraction_head=args.fraction_head,
-                           bridge_alpha=args.height_bridge_alpha)
+                           bridge_alpha=args.height_bridge_alpha,
+                           use_terramind=args.use_terramind)
     model = model.to(device)
     print(f"   >> params: {sum(p.numel() for p in model.parameters())/1e6:.2f}M"
           f"  (height_bridge={'off' if args.no_height_bridge else 'on'})")

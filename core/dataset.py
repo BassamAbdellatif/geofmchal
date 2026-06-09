@@ -392,6 +392,7 @@ class GeoFMDataset7A(Dataset):
         cache_dir=None,
         rebuild_cache=False,
         patch_inputs=("terramind_s1", "terramind_s2"),
+        include_folds=None,
     ):
         # Active THOR patch streams (subset of thor_s1, thor_s2). When empty the
         # dataset behaves byte-identically to the pre-Phase-5D version: same cache
@@ -402,7 +403,13 @@ class GeoFMDataset7A(Dataset):
         with open(geo_folds_path) as f:
             folds = json.load(f)
 
-        if is_train:
+        # [Phase 11 fast-dev] include_folds overrides the cv_fold split: include
+        # exactly the tiles whose geo-fold is in the given set (e.g. train on fold 0,
+        # validate on fold 1). is_train still controls augmentation only.
+        if include_folds is not None:
+            inc = set(include_folds)
+            self.tiles = [t for t in tiles if folds.get(t["core_id"], -999) in inc]
+        elif is_train:
             self.tiles = [t for t in tiles if folds.get(t["core_id"], cv_fold) != cv_fold]
         else:
             self.tiles = [t for t in tiles if folds.get(t["core_id"], cv_fold) == cv_fold]
@@ -435,7 +442,12 @@ class GeoFMDataset7A(Dataset):
         # no per-worker duplication). Augmentation is still applied per __getitem__.
         self._cache = None
         if cache_dir is not None:
-            tag = f"fold{cv_fold}_{'train' if is_train else 'val'}"
+            if include_folds is not None:
+                # Cache keyed by the fold set (content is the same tiles regardless
+                # of train/val role), e.g. finc0 / finc1.
+                tag = "finc" + "-".join(str(x) for x in sorted(include_folds))
+            else:
+                tag = f"fold{cv_fold}_{'train' if is_train else 'val'}"
             self._init_cache(cache_dir, tag, rebuild_cache)
 
     # ------------------------------------------------------------------ caching
