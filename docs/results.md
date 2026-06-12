@@ -874,3 +874,32 @@ Decoupling helped the **train→test generalization gap** on height (platform ga
 height now protected → **veg-weight sweep launched** (decoupled, cv-fold 1): `12_dech_wb1wv5` (wb1/wv5),
 `12_dech_wb2wv5` (wb2/wv5), `12_dech_wb2wv3` (wb2/wv3) — push RMSE_V (and RMSE_B) further now that the
 trade is gone. Remaining levers: RMSE_V (0.187 room, tractable) and IoU_B (0.143, stuck everywhere).
+
+### 39. Decoupled weight sweep: build-weight=2 helps marginally, veg>3 doesn't; fine cross-modal = NEGATIVE (2026-06-13)
+All cv-fold 1, 40 ep, vs `12_dech_f1` (0.4599; submitted, platform 0.4277). Best-proxy:
+
+| run | proxy | IoU_B | IoU_W | RMSE_B | RMSE_V |
+|-----|-------|-------|-------|--------|--------|
+| `12_dech_f1` (wb1/wv3) | 0.4599 | 0.3430 | 0.6438 | 1.834 | 3.500 |
+| `12_dech_wb1wv5` | 0.4565 | 0.3432 | 0.6184 | 1.829 | 3.496 |
+| **`12_dech_wb2wv5`** | 0.4626 | **0.3503** | 0.6449 | **1.813** | 3.509 |
+| `12_dech_wb2wv3` | **0.4638** | 0.3411 | **0.6829** | 1.850 | 3.512 |
+
+- **`build_height_weight=2` is the lever; `veg_height_weight>3` is not.** Both wb2 arms beat `12_dech_f1`;
+  wv5 *hurts* at wb1 (0.4565 < 0.4599). So veg-weight ~3 is near-optimal, further height gain comes from
+  pushing **building** weight. **`wb2wv5` chosen to submit** (gains on reliable RMSE_B −0.021 + IoU_B
+  +0.007; `wb2wv3`'s higher proxy is almost all IoU_W +0.039 = fold-noise, and its height is *worse*).
+  Caveat: +0.0027 is within the ±0.005 noise band — a marginal bet on RMSE_B platform-amplification.
+
+- **Fine windowed cross-modal (`12_xmodal_fine_f1`, L1/L2 8×8 windows) = NEGATIVE** (0.4461 < baseline
+  11_fresh_f1 0.4516; IoU_B 0.3471 no lift; IoU_W −0.035, RMSE_V +0.032). **But the gates validated the
+  "too coarse" hypothesis mechanically:** fine gates opened to mean |gate| **0.0304** and kept *growing*
+  (0.0164@ep21 → 0.0304@ep40) vs coarse's dead **0.0011** — at fine resolution there IS cross-modal
+  structure the model reaches for; **using it just doesn't help the task (it degrades).** So **cross-modal
+  fusion is a confirmed dead-end at BOTH resolutions** (coarse: gates shut/null; fine: gates open/hurts).
+  **No need to escalate to L0.** `--cross-modal` stays off by default.
+
+**Lever status (post-Phase-12):** decoupled height = the win (banked, +0.0152 platform). Remaining easy
+gains nearly exhausted: build-weight=2 marginal; veg maxed; **TerraMind (f36), cross-modal (f38/f39) all
+dead**; IoU_B stuck across every lever (→ embedding-information ceiling at 10 m, not architecture). Next:
+submit `wb2wv5`, then end-stage **multi-fold/seed ensembling** rather than more single-model swings.

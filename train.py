@@ -175,9 +175,10 @@ def parse_args():
                              "'xattn' = shared gated cross-attention (0.408, helps IoU/hurts height); "
                              "'xattn_frac' = cross-attn routed to fraction decoder only (height stays "
                              "clean); 'xattn_frac_loc' = xattn_frac + soft Gaussian locality bias.")
-    parser.add_argument("--cross-modal", type=str, default="off", choices=["off", "coarse"],
+    parser.add_argument("--cross-modal", type=str, default="off", choices=["off", "coarse", "fine"],
                         help="[Phase 12c] fresh_extract: bidirectional alpha<->tessera cross-attention "
-                             "at coarse encoder levels L3/L4, before the 1x1 fuse. 'off' = byte-identical.")
+                             "before the 1x1 fuse. 'coarse' = global at L3/L4 (null, f38); 'fine' = "
+                             "windowed (8x8) at L0/L1 where building structure lives; 'off' = byte-identical.")
     parser.add_argument("--cross-modal-local", action="store_true",
                         help="[Phase 12c] add the soft Gaussian locality bias to the cross-modal blocks.")
     parser.add_argument("--height-bridge-alpha", type=float, default=0.2,
