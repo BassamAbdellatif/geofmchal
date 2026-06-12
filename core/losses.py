@@ -248,7 +248,8 @@ class DualPathLoss(nn.Module):
                  height_bg_weight=0.1, veg_height_boost=0.0, veg_boost_thresh=0.1,
                  use_binary=True, fraction_head="sigmoid3", building_overlap="dice",
                  tversky_alpha=0.3, tversky_beta=0.7, focal_tversky_gamma=1.333,
-                 building_overlap_weight=1.0):
+                 building_overlap_weight=1.0, decouple_height=False,
+                 build_height_weight=1.0, veg_height_weight=1.0):
         """
         veg_height_boost: extra weight on the masked Huber for vegetation pixels
             (veg_frac > veg_boost_thresh). Default 0.0 reproduces the Phase-4
@@ -271,6 +272,13 @@ class DualPathLoss(nn.Module):
         self.height_bg_weight = height_bg_weight
         self.veg_height_boost = veg_height_boost
         self.veg_boost_thresh = veg_boost_thresh
+        # [Phase 12] Decoupled height: separate, independently-weighted Huber terms
+        # for building vs veg pixels (instead of one shared mask + veg-only boost), so
+        # boosting veg height does NOT starve building height. build/veg pixels are
+        # ~spatially disjoint, so one head fits both when neither is gradient-starved.
+        self.decouple_height = decouple_height
+        self.build_height_weight = build_height_weight
+        self.veg_height_weight = veg_height_weight
         self.use_binary = use_binary
         self.fraction_head = fraction_head
         self.building_overlap = building_overlap
@@ -341,23 +349,37 @@ class DualPathLoss(nn.Module):
         loss_fraction = self._fraction_loss(frac_logits, frac_target)
 
         # Height: Huber, masked (building OR veg present) + small bg tail.
-        mask = ((build_frac > 0) | (veg_frac > 0)).float()
         huber = F.huber_loss(height_pred, height_target, delta=self.huber_delta,
                              reduction="none")
-        m_sum = mask.sum().clamp_min(1.0)
-        bg = 1.0 - mask
-        bg_sum = bg.sum().clamp_min(1.0)
-        loss_height = (huber * mask).sum() / m_sum \
-            + self.height_bg_weight * (huber * bg).sum() / bg_sum
-
-        # Vegetation-height boost: extra weighted Huber where vegetation is
-        # present, to drive RMSE_V down (the 3.9 m scoring-floor term). Mean over
-        # the veg-pixel count so the term is scale-comparable to the masked Huber.
-        if self.veg_height_boost > 0.0:
-            veg_mask = (veg_frac > self.veg_boost_thresh).float()
-            veg_sum = veg_mask.sum().clamp_min(1.0)
-            loss_height = loss_height \
-                + self.veg_height_boost * (huber * veg_mask).sum() / veg_sum
+        if self.decouple_height:
+            # [Phase 12] Separate building / veg height terms, each normalised over
+            # its own pixel count and independently weighted, so raising the veg
+            # weight cannot starve building-height gradient (the vboost wash, f37).
+            bmask = (build_frac > self.veg_boost_thresh).float()
+            vmask = (veg_frac > self.veg_boost_thresh).float()
+            bgm = ((build_frac <= self.veg_boost_thresh) &
+                   (veg_frac <= self.veg_boost_thresh)).float()
+            b_sum = bmask.sum().clamp_min(1.0)
+            v_sum = vmask.sum().clamp_min(1.0)
+            bg_sum = bgm.sum().clamp_min(1.0)
+            loss_height = self.build_height_weight * (huber * bmask).sum() / b_sum \
+                + self.veg_height_weight * (huber * vmask).sum() / v_sum \
+                + self.height_bg_weight * (huber * bgm).sum() / bg_sum
+        else:
+            mask = ((build_frac > 0) | (veg_frac > 0)).float()
+            m_sum = mask.sum().clamp_min(1.0)
+            bg = 1.0 - mask
+            bg_sum = bg.sum().clamp_min(1.0)
+            loss_height = (huber * mask).sum() / m_sum \
+                + self.height_bg_weight * (huber * bg).sum() / bg_sum
+            # Vegetation-height boost: extra weighted Huber where vegetation is
+            # present, to drive RMSE_V down. Mean over the veg-pixel count so the
+            # term is scale-comparable to the masked Huber.
+            if self.veg_height_boost > 0.0:
+                veg_mask = (veg_frac > self.veg_boost_thresh).float()
+                veg_sum = veg_mask.sum().clamp_min(1.0)
+                loss_height = loss_height \
+                    + self.veg_height_boost * (huber * veg_mask).sum() / veg_sum
 
         # Aux binary building head: BCE + soft Dice on (build_frac > 0.5).
         # Phase 5C: with use_binary=False the term is dropped entirely (the head

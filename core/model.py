@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -342,7 +343,8 @@ def build_model(model_type, n_channels, n_classes, use_height_bridge=True,
                 patch_stem_version="v2", xattn_heads=4,
                 patch_routing="sensor",
                 use_fraction_bridge=False, fraction_bridge_alpha=0.2,
-                fraction_head="sigmoid3", bridge_alpha=0.2, use_terramind=True):
+                fraction_head="sigmoid3", bridge_alpha=0.2, use_terramind=True,
+                terramind_fusion="add", cross_modal="off", cross_modal_local=False):
     selected = model_type.lower()
 
     if selected == "auto":
@@ -371,6 +373,9 @@ def build_model(model_type, n_channels, n_classes, use_height_bridge=True,
             fraction_head=fraction_head,
             use_terramind=use_terramind,
             patch_stem_version=patch_stem_version,
+            terramind_fusion=terramind_fusion,
+            cross_modal=cross_modal,
+            cross_modal_local=cross_modal_local,
         ), selected
 
     raise ValueError(
@@ -917,6 +922,72 @@ class _PyrDecoder(nn.Module):
         return x
 
 
+class _TokenCrossAttn(nn.Module):
+    """Pixel features (queries) cross-attend to TerraMind tokens (keys/values).
+
+    Multi-head dot-product attention: each pixel-pyramid location pulls context from
+    the 16x16 TerraMind token grid where it helps, instead of the coarse signal being
+    added everywhere (additive injection = the modality-dominance failure mode; cf.
+    the symmetric-fusion / modality-balancing literature). The output is a GATED
+    residual with the gate initialised to 0, so at start the block is exactly identity
+    — it can only *add* signal if it earns it, never degrading the working pixel path.
+    """
+
+    def __init__(self, q_ch, kv_ch, heads=4, local_bias=False):
+        super().__init__()
+        assert q_ch % heads == 0, f"q_ch {q_ch} not divisible by heads {heads}"
+        self.heads = heads
+        self.scale = (q_ch // heads) ** -0.5
+        self.local_bias = local_bias
+        self.norm_q = nn.GroupNorm(1, q_ch)          # LN-like over channels
+        self.q = nn.Conv2d(q_ch, q_ch, 1, bias=False)
+        self.k = nn.Conv2d(kv_ch, q_ch, 1, bias=False)
+        self.v = nn.Conv2d(kv_ch, q_ch, 1, bias=False)
+        self.proj = nn.Conv2d(q_ch, q_ch, 1, bias=False)
+        self.gate = nn.Parameter(torch.zeros(1))
+        if local_bias:
+            # Soft locality (Tobler): subtract a per-head Gaussian distance penalty
+            # from the attention logits before softmax. Distance is in normalised
+            # [0,1] tile coords (so it works across the L3/L4 query-vs-token grid
+            # mismatch). sigma is learnable per head — init 0.15 (~1-2 token cells of
+            # the 16x16 grid) so attention STARTS local and can widen only if earned.
+            self.log_sigma = nn.Parameter(torch.full((heads,), math.log(0.15)))
+            self._dist_cache = {}
+
+    def _dist2(self, Hq, Wq, Ht, Wt, device):
+        kkey = (Hq, Wq, Ht, Wt, str(device))
+        d = self._dist_cache.get(kkey)
+        if d is None:
+            qy = (torch.arange(Hq, device=device) + 0.5) / Hq
+            qx = (torch.arange(Wq, device=device) + 0.5) / Wq
+            ky = (torch.arange(Ht, device=device) + 0.5) / Ht
+            kx = (torch.arange(Wt, device=device) + 0.5) / Wt
+            qc = torch.stack(torch.meshgrid(qy, qx, indexing="ij"), -1).reshape(-1, 2)  # Nq,2
+            kc = torch.stack(torch.meshgrid(ky, kx, indexing="ij"), -1).reshape(-1, 2)  # Nk,2
+            d = ((qc[:, None, :] - kc[None, :, :]) ** 2).sum(-1)                         # Nq,Nk
+            self._dist_cache[kkey] = d
+        return d
+
+    def forward(self, x, tok):
+        # x: (B, q_ch, Hq, Wq)  queries ;  tok: (B, kv_ch, Ht, Wt)  keys/values
+        B, C, Hq, Wq = x.shape
+        Ht, Wt = tok.shape[-2:]
+        h, d = self.heads, C // self.heads
+        xn = self.norm_q(x)
+        q = self.q(xn).reshape(B, h, d, Hq * Wq)             # B,h,d,Nq
+        k = self.k(tok).reshape(B, h, d, -1)                 # B,h,d,Nk
+        v = self.v(tok).reshape(B, h, d, -1)                 # B,h,d,Nk
+        logits = (q.transpose(-2, -1) @ k) * self.scale      # B,h,Nq,Nk
+        if self.local_bias:
+            dist2 = self._dist2(Hq, Wq, Ht, Wt, x.device)            # Nq,Nk
+            sigma2 = (self.log_sigma.exp() ** 2).clamp_min(1e-6)     # h
+            logits = logits + (-dist2[None] / (2 * sigma2[:, None, None]))[None]  # B,h,Nq,Nk
+        attn = torch.softmax(logits, dim=-1)
+        out = (attn @ v.transpose(-2, -1)).transpose(-2, -1)  # B,h,d,Nq
+        out = out.reshape(B, C, Hq, Wq)
+        return x + self.gate * self.proj(out)
+
+
 class FreshExtract(nn.Module):
     """
     Deep dual pixel encoders (alpha 64@256, tessera 128@256) at full resolution, with
@@ -931,11 +1002,19 @@ class FreshExtract(nn.Module):
     CHANNELS = [96, 160, 256, 384, 512]   # @ [256,128,64,32,16]
 
     def __init__(self, patch_inputs=("terramind_s1", "terramind_s2"),
-                 fraction_head="softmax4", use_terramind=True, patch_stem_version="v1"):
+                 fraction_head="softmax4", use_terramind=True, patch_stem_version="v1",
+                 terramind_fusion="add", cross_modal="off", cross_modal_local=False):
         super().__init__()
         c = self.CHANNELS
         self.fraction_head = fraction_head
         self.use_terramind = use_terramind
+        # "add" (legacy) | "xattn" (shared, gated cross-attn) | "xattn_frac" (cross-attn
+        # routed to the FRACTION decoder only, height stays clean) | "xattn_frac_loc"
+        # (xattn_frac + soft Gaussian locality bias).
+        self.terramind_fusion = terramind_fusion
+        self.tm_xattn = terramind_fusion.startswith("xattn")
+        self.tm_frac_only = terramind_fusion in ("xattn_frac", "xattn_frac_loc")
+        tm_local = terramind_fusion == "xattn_frac_loc"
         self.patch_inputs = list(patch_inputs)
         self.alpha_stem = _ModalityStem(64, c[0])
         self.tessera_stem = _ModalityStem(128, c[0])
@@ -945,7 +1024,21 @@ class FreshExtract(nn.Module):
         if use_terramind and self.patch_inputs:
             self.tok_stems = nn.ModuleDict(
                 {n: _make_patch_stem(patch_stem_version, 768, c[4]) for n in self.patch_inputs})
-            self.tok_to_l3 = nn.Conv2d(c[4], c[3], 1, bias=False)
+            if self.tm_xattn:
+                # pixel pyramid = queries, tokens (c[4]@16) = keys/values, gated residual.
+                self.xattn_l4 = _TokenCrossAttn(c[4], c[4], heads=4, local_bias=tm_local)  # 16x16 q
+                self.xattn_l3 = _TokenCrossAttn(c[3], c[4], heads=4, local_bias=tm_local)  # 32x32 q
+            else:
+                self.tok_to_l3 = nn.Conv2d(c[4], c[3], 1, bias=False)
+        # Coarse alpha<->tessera bidirectional cross-attention (Phase 12c), applied to
+        # the two encoder pyramids at L3/L4 BEFORE the static 1x1 `fuse`. Gated zero-init
+        # residual (identity at start). Off => byte-identical to the prior path.
+        self.cross_modal = cross_modal
+        if cross_modal == "coarse":
+            self.xmod_a3 = _TokenCrossAttn(c[3], c[3], heads=4, local_bias=cross_modal_local)  # a<-t @32
+            self.xmod_t3 = _TokenCrossAttn(c[3], c[3], heads=4, local_bias=cross_modal_local)  # t<-a @32
+            self.xmod_a4 = _TokenCrossAttn(c[4], c[4], heads=4, local_bias=cross_modal_local)  # a<-t @16
+            self.xmod_t4 = _TokenCrossAttn(c[4], c[4], heads=4, local_bias=cross_modal_local)  # t<-a @16
         self.fraction_decoder = _PyrDecoder(c)
         self.height_decoder = _PyrDecoder(c)
         nfrac = 4 if fraction_head == "softmax4" else 3
@@ -969,14 +1062,30 @@ class FreshExtract(nn.Module):
         t0 = self.tessera_stem(batch["tessera"])
         aP = self.alpha_enc(a0)
         tP = self.tessera_enc(t0)
+        if self.cross_modal == "coarse":
+            # both directions from the ORIGINAL features (no leakage), then assign back.
+            a3 = self.xmod_a3(aP[3], tP[3]); t3 = self.xmod_t3(tP[3], aP[3])
+            a4 = self.xmod_a4(aP[4], tP[4]); t4 = self.xmod_t4(tP[4], aP[4])
+            aP[3], tP[3], aP[4], tP[4] = a3, t3, a4, t4
         pyr = [self.fuse[l](torch.cat([aP[l], tP[l]], dim=1)) for l in range(5)]
+        pyr_frac = pyr                                   # default: both decoders share one pyramid
         if self.use_terramind and self.patch_inputs:
             tok = self._tokens_16(batch)
             if tok is not None:
-                pyr[4] = pyr[4] + tok
-                up = F.interpolate(tok, size=pyr[3].shape[-2:], mode="bilinear", align_corners=False)
-                pyr[3] = pyr[3] + self.tok_to_l3(up)
-        ffeat = self.fraction_decoder(pyr)
+                if self.tm_xattn:
+                    inj = list(pyr)
+                    inj[4] = self.xattn_l4(pyr[4], tok)   # 16x16 queries attend to tokens
+                    inj[3] = self.xattn_l3(pyr[3], tok)   # 32x32 queries attend to tokens
+                    if self.tm_frac_only:
+                        pyr_frac = inj                    # height_decoder keeps the clean `pyr`
+                    else:
+                        pyr = pyr_frac = inj              # shared: both decoders see tokens
+                else:
+                    pyr[4] = pyr[4] + tok
+                    up = F.interpolate(tok, size=pyr[3].shape[-2:], mode="bilinear", align_corners=False)
+                    pyr[3] = pyr[3] + self.tok_to_l3(up)
+                    pyr_frac = pyr
+        ffeat = self.fraction_decoder(pyr_frac)
         hfeat = self.height_decoder(pyr)
         return {"fraction": self.frac_head(ffeat),
                 "height": self.height_head(hfeat),

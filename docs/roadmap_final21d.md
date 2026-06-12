@@ -104,3 +104,20 @@ We're in the harder world. Outcome of the plan above (detail: `results.md` f29�
 (heavier decoder / multi-seed ensemble / a dedicated better height model) — uncertain, top-3 out of
 reach in the remaining days. P1 (gradient), P3a (sampling), P2/P3b: closed-negative. Calibration/TTA:
 excluded (TTA hurts; calibration won't transfer).
+
+---
+
+## STATUS UPDATE — 2026-06-11 (the swing paid off; pivot to height)
+
+We took option (b). **`11_fresh_f1` (fresh_extract, single self-contained model) = 0.4125, rank 43**
+(up from 54). The capacity/fusion swing **broke the supposedly-intrinsic IoU_B ceiling**: platform
+IoU_B 0.35→0.43, RMSE_B 2.23 (near the field's top). Detail: `results.md` f35.
+
+**The plan above (close-the-IoU_B-gap) is superseded.** IoU_B is no longer the binding constraint —
+**RMSE_veg is.** Veg location is solved (IoU_V 0.806) but veg height (3.81 m) earns only 0.010 of a
+possible 0.20 → **0.190 of unrealized score, the single biggest lever by far.** And it was
+self-inflicted: we shipped with `veg_height_boost=0` and an old-7A-inherited height weight (0.64).
+
+**Active plan → `docs/phase12_height.md` (Height-First Campaign).** Cheapest-first: re-enable
+`veg_height_boost` + raise height task weight (judge on RMSE_V, multi-fold); separate/scale-aware
+veg-height loss; AlphaEarth-GEDI/DEM height pathway; then IoU_B 0.43→0.5+ and IoU_W. ~19 days left.

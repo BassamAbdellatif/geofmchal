@@ -703,3 +703,135 @@ model" gap, not a structural-resolution fix.
   lags even simple 2A's 3.70). 
 - **Honest position:** top-3 (+0.12) is out of reach; the realistic choice is (a) consolidate the
   0.3871 best, or (b) a capacity/height swing knowing it's a long shot. Pending decision.
+
+---
+
+## Phase 11 — Fresh Extraction Architecture: PLATFORM ANCHOR (2026-06-11) — BREAKTHROUGH
+
+We took the fork's option (b) — the capacity swing — and it **worked**. `fresh_extract` (deep dual
+pixel encoders + symmetric multi-scale fusion + own height head; ~50M params; sm4tv objective; no
+TerraMind), trained on geo-folds {0,2,3,4} / val fold 1 (`11_fresh_f1`), single self-contained model,
+no graft. Submitted 2026-06-11.
+
+### 35. The fresh architecture broke the "intrinsic IoU_B ceiling" — and isolated height as the one remaining lever
+Platform result `11_fresh_f1` = **0.4125 (rank 43, up from 54)**, vs prior best
+`9_sm4tv_final_hybrid` 0.3871 (rank 54): **+0.025**.
+
+| metric | hybrid 0.3871 (platform) | **11_fresh_f1 (platform)** | top-1 ≈ 0.5448 | contribution (w) | **gap to max** |
+|--------|--------------------------|----------------------------|----------------|------------------|----------------|
+| IoU_build  | ~0.35 | **0.4297** | ~0.53 | 0.107 (0.25) | 0.143 |
+| IoU_veg    | —     | **0.8062** | —     | 0.121 (0.15) | **0.029 ✅ near-max** |
+| IoU_water  | —     | **0.4797** | —     | 0.072 (0.15) | 0.078 |
+| RMSE_build | 2.28  | **2.2256** | ~1.85 | 0.111 (0.25) | 0.139 (already strong) |
+| **RMSE_veg** | 3.70 | **3.8069** | ~3.0 | **0.010 (0.20)** | **0.190 🔴 the giant** |
+
+Reverse-engineered proxy predicts 0.421 vs actual 0.4125 (~0.008 off — formula is approximate but the
+*ranking* of levers is robust).
+
+**What this overturns:**
+- **f28/f34's "IoU_B ~0.18 ceiling is intrinsic / extraction gap unbeatable in 20 days" is FALSIFIED.**
+  Platform IoU_B went 0.35 → **0.43** purely by adding capacity + symmetric fusion (Bets 1+2). The gap
+  *was* extraction/capacity, and capacity *closed most of it*. RMSE_B is now near the top of the field.
+- The "consolidate at 0.3871" option is dead — the swing paid off.
+
+**What it isolates — RMSE_veg is now the entire game:**
+- Veg *location* is essentially solved (IoU_V **0.806**, near max). The model finds vegetation; it
+  predicts its **height** poorly (3.81 m → earns 0.010 of a possible 0.20). That single metric holds
+  **0.190** of unrealized score — more than the other four *combined* room.
+- Root cause is a self-inflicted under-investment, not a ceiling:
+  1. `11_fresh_f1` ran with **`veg_height_boost = 0.0`** — the loss term *purpose-built to drive RMSE_V
+     down* was OFF. We disabled it because Phase-11 fast-split screening called it "a net wash." That
+     verdict was a **proxy artifact**: fast-split RMSE_V was underfit/noisy, and the *internal*
+     composite under-weighted height vs the platform's real 0.20. The platform says we turned off the
+     one knob that matters most.
+  2. **Height task weight = 0.64** (`--static-weights 0.65,0.64,1.70`) — inherited verbatim from the
+     *old* 7A GradNorm convergence (`7A_base_e90 ep59`), never re-tuned for the fresh model.
+  3. Height loss masks **building OR veg jointly** (one shared Huber, δ=0.5 ⇒ ~15 m normalized ⇒
+     effectively MSE). Buildings (RMSE_B 2.23 ✓) and veg (RMSE_V 3.81 ✗) share one head — veg height is
+     intrinsically higher-variance and is being out-competed.
+- Secondary signal: internal fold-1 RMSE_V 3.56 → platform 3.81 = a **generalization gap** (region/year
+  shift) on height specifically → variance reduction (all-data final, light embedding domain-aug) helps.
+
+**Verdict:** pivot to a **height-first campaign (Phase 12)**. Levers, cheapest-first: re-enable
+`veg_height_boost` + raise the height task weight (judge on RMSE_V directly, multi-fold); then
+separate/scale-aware veg-height treatment; then an AlphaEarth-GEDI/DEM → veg-height pathway (Bet 1
+strengthening — alpha *encodes* canopy height). IoU_B (0.43→0.5+) and IoU_W (0.48) are the next two,
+smaller, levers. RMSE_B is near-max — leave it. Detail: `docs/phase12_height.md`.
+
+---
+
+## Phase 12a — TerraMind fusion ablation on fresh_extract (2026-06-12) — NEGATIVE (drop TerraMind)
+
+We dropped TerraMind for `11_fresh_f1` based on a fast-screen where the *additive* injection
+(`pyr += tok`) hurt. Before fully abandoning it we tested whether **cross-attention** (the lit-review
+Alt-1 recommendation; CLAIRE/MMFNet; the way TerraMind itself separates token=context vs pixel=detail)
+would rescue it. Fast screen throughout: pixel-only deep dual-encoder, train fold 0 / val fold 1, 30 ep,
+seed 0, sm4tv, GPUs power-capped 100 W.
+
+### 36. TerraMind does not earn its place on fresh_extract — four fusion variants all tie pixel-only
+| arm | fusion | proxy | IoU_B | IoU_V | IoU_W | RMSE_B | RMSE_V |
+|-----|--------|-------|-------|-------|-------|--------|--------|
+| `notm` | none (pixel-only) | **0.4074** | 0.3117 | 0.7604 | 0.5896 | **2.108** | **3.824** |
+| `tm_add` | residual add | 0.3993 | 0.3093 | 0.7647 | 0.5652 | 2.113 | 3.910 |
+| `tm_xattn` | shared gated cross-attn | 0.4078 | 0.3168 | 0.7660 | 0.6211 | 2.191 | 3.851 |
+| `12_frac_route_A` | cross-attn → fraction decoder only | 0.4079 | 0.3168 | 0.7661 | 0.6196 | 2.182 | 3.856 |
+| `12_frac_loc_B` | frac-only + Gaussian locality bias | 0.4057 | 0.3170 | 0.7661 | 0.6174 | 2.218 | 3.848 |
+
+Four sub-findings:
+1. **Cross-attention >> additive** (0.3993 → 0.4078): the mechanism matters exactly as the literature
+   predicts — gated attention lets each pixel *select* token context; additive forces the coarse signal
+   on every pixel (the modality-dominance failure). Good science, but…
+2. **…all xattn variants merely TIE pixel-only.** Whole family sits in a ~0.002 band around `notm`
+   0.4074; best (frac-route, 0.4079) = +0.0005 = noise. The IoU bumps (IoU_W +0.03, IoU_B +0.005) are
+   exactly cancelled by RMSE wiggles. **TerraMind adds nothing net on this architecture.**
+3. **Fraction-only routing did NOT recover height** (A height 2.18/3.86 ≈ shared 2.19/3.85, both > notm
+   2.11/3.82) — even though the height decoder is *bit-isolated* from tokens at inference (verified).
+   So the height degradation was **never** token-injection into the height decoder; the only remaining
+   coupling is **shared-encoder gradients**, or it is **fold noise** (effect is ~0.03 m, single fold).
+   This **reframes the earlier "cross-attention hurts regression" question — it was mis-posed.**
+4. **Locality bias slightly HURT** (B 0.4057 < A 0.4079). Tobler's-law worry is theoretically valid but
+   **empirically did not bite**: TerraMind tokens are *already spatially contextualized* (mixed globally
+   in TM pretraining), so a hard spatial prior discards context the tokens legitimately carry.
+
+**Verdict:** TerraMind is **dropped** on fresh_extract (tested add / shared-xattn / frac-route /
+frac-loc — none clears pixel-only). The `_TokenCrossAttn` block + `--terramind-fusion {xattn,xattn_frac,
+xattn_frac_loc}` are kept in code (off by default) for reuse. The dominant lever was never the patch
+tokens — it is **RMSE_V (0.190)**. Proceeding to the height-first run (f37, pending).
+
+---
+
+## Phase 12b — Height campaign: vboost wash on the full model → decoupled height (2026-06-12)
+
+### 37. veg_height_boost lowers RMSE_V but starves building height → net wash on the well-fit model
+**Fast screen** (train fold 0 / val fold 1, underfit baseline) made vboost look like a clear win — the
+0/2/3/4/6 sweep was monotone-ish, vboost=3 → proxy 0.4156 vs notm 0.4074 (RMSE_V 3.824→3.680). But the
+sweep was noisy (b4 dipped below b3; run-to-run ≈ dose differences) and, crucially, **measured against an
+underfit 514-tile baseline.**
+
+On the **full cv-fold-1 config** (`12_vb3_f1`, vboost=3, 40 ep, directly comparable to `11_fresh_f1`), it
+**washes out** (internal fold-1 val, best-proxy checkpoints):
+
+| | proxy | IoU_B | IoU_V | IoU_W | RMSE_B | RMSE_V |
+|--|-------|-------|-------|-------|--------|--------|
+| `11_fresh_f1` (vb0) | 0.4516 | 0.3487 | 0.7805 | 0.6025 | **1.876** | 3.516 |
+| `12_vb3_f1` (vb3) | 0.4515 | 0.3471 | 0.7819 | **0.6174** | 1.946 | **3.472** |
+
+vboost=3 bought **RMSE_V −0.044** (✓) and **IoU_W +0.015** (✓) but cost **RMSE_B +0.070** (✗). Score
+arithmetic (RMSE_B weight **0.25** > RMSE_V **0.20**): +0.0022 (V) − 0.0044 (B) + 0.0022 (W) ≈ **0** →
+tied proxy. **Two lessons:** (a) the fast screen's positive verdict was a *proxy artifact* of an underfit
+baseline (cf. f29); (b) **the shared single height head makes vboost a *reallocation*, not a mutual
+boost** — emphasising veg pixels starves building-height gradient (buildings & canopy have different
+height distributions, so the shared head trades one for the other). Do **not** submit `12_vb3_f1` (wash;
+the RMSE_B/RMSE_V weight asymmetry tilts it slightly negative).
+
+### Fix — decoupled height loss (launched 2026-06-12)
+`DualPathLoss(decouple_height=True, build_height_weight, veg_height_weight)`: separate, independently-
+normalised Huber terms for building vs veg pixels instead of one shared mask + veg-only boost. **Verified**
+(disjoint building/veg layout): building-pixel height gradient is bit-identical across veg_w=1 vs 5
+(building **not** starved) while veg gradient scales exactly 5× — so we can pull RMSE_V down *without* the
+RMSE_B cost. Build/veg pixels are ~spatially disjoint, so one head fits both when neither is gradient-starved.
+
+**Two runs in flight (cv-fold 1, 40 ep, each = `11_fresh_f1` recipe + one change):**
+- `12_dech_f1` (node1) — **decoupled height**, build_w=1.0 / veg_w=3.0 (boost veg, hold building).
+- `12_xmodal_f1` (node2) — **alpha↔tessera coarse cross-attention** (`--cross-modal coarse`; Phase 12c,
+  the IoU_B/capacity play, orthogonal to height).

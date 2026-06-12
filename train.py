@@ -168,6 +168,18 @@ def parse_args():
     parser.add_argument("--use-terramind", action=argparse.BooleanOptionalAction, default=True,
                         help="[Phase 11] fresh_extract: inject TerraMind tokens (default True). "
                              "--no-use-terramind = pixel-only ablation (Bet 3b).")
+    parser.add_argument("--terramind-fusion", type=str, default="add",
+                        choices=["add", "xattn", "xattn_frac", "xattn_frac_loc"],
+                        help="[Phase 12] fresh_extract: how TerraMind tokens enter the pyramid. "
+                             "'add' = legacy residual injection (proxy 0.399, hurt); "
+                             "'xattn' = shared gated cross-attention (0.408, helps IoU/hurts height); "
+                             "'xattn_frac' = cross-attn routed to fraction decoder only (height stays "
+                             "clean); 'xattn_frac_loc' = xattn_frac + soft Gaussian locality bias.")
+    parser.add_argument("--cross-modal", type=str, default="off", choices=["off", "coarse"],
+                        help="[Phase 12c] fresh_extract: bidirectional alpha<->tessera cross-attention "
+                             "at coarse encoder levels L3/L4, before the 1x1 fuse. 'off' = byte-identical.")
+    parser.add_argument("--cross-modal-local", action="store_true",
+                        help="[Phase 12c] add the soft Gaussian locality bias to the cross-modal blocks.")
     parser.add_argument("--height-bridge-alpha", type=float, default=0.2,
                         help="[Phase 10] GradScale alpha on the alpha(optical)->height-decoder "
                              "bridge: fraction of the height-loss gradient that reaches the alpha "
@@ -210,6 +222,13 @@ def parse_args():
     parser.add_argument("--veg-height-boost", type=float, default=0.0,
                         help="[7A P5.1] Extra weight on masked Huber for vegetation pixels "
                              "(veg_frac>0.1). 0.0 = Phase-4 baseline; try 2-3 to lower RMSE_V.")
+    parser.add_argument("--decouple-height", action="store_true",
+                        help="[Phase 12] Separate building/veg height Huber terms (independent "
+                             "weights, own normalisation) so boosting veg does not starve building.")
+    parser.add_argument("--build-height-weight", type=float, default=1.0,
+                        help="[Phase 12] Weight on the building-pixel height term (decoupled mode).")
+    parser.add_argument("--veg-height-weight", type=float, default=1.0,
+                        help="[Phase 12] Weight on the veg-pixel height term (decoupled mode).")
     parser.add_argument("--cache-dir", type=str, default=None,
                         help="[7A] Directory for the memmap float16 tile cache. If set, "
                              "tiles are preprocessed once and served from the (page-cached) "
@@ -703,6 +722,9 @@ def train_7a(args):
         f.write(f"EPOCHS: {args.epochs}\n")
         f.write(f"CV_FOLD: {args.cv_fold}\n")
         f.write(f"VEG_HEIGHT_BOOST: {args.veg_height_boost}\n")
+        f.write(f"DECOUPLE_HEIGHT: {args.decouple_height}\n")
+        f.write(f"BUILD_HEIGHT_WEIGHT: {args.build_height_weight}\n")
+        f.write(f"VEG_HEIGHT_WEIGHT: {args.veg_height_weight}\n")
         f.write(f"CACHE_DIR: {args.cache_dir}\n")
         f.write(f"USE_STRATIFIED_SAMPLER: {args.use_stratified_sampler}\n")
         f.write(f"USE_GRADNORM: {args.use_gradnorm}\n")
@@ -715,6 +737,9 @@ def train_7a(args):
         f.write(f"FRACTION_BRIDGE_ALPHA: {args.fraction_bridge_alpha}\n")
         f.write(f"HEIGHT_BRIDGE_ALPHA: {args.height_bridge_alpha}\n")
         f.write(f"USE_TERRAMIND: {args.use_terramind}\n")
+        f.write(f"TERRAMIND_FUSION: {args.terramind_fusion}\n")
+        f.write(f"CROSS_MODAL: {args.cross_modal}\n")
+        f.write(f"CROSS_MODAL_LOCAL: {args.cross_modal_local}\n")
         f.write(f"TRAIN_FOLDS: {args.train_folds}\n")
         f.write(f"VAL_FOLDS: {args.val_folds}\n")
         f.write(f"STATIC_WEIGHTS: {args.static_weights}\n")
@@ -792,7 +817,10 @@ def train_7a(args):
                            fraction_bridge_alpha=args.fraction_bridge_alpha,
                            fraction_head=args.fraction_head,
                            bridge_alpha=args.height_bridge_alpha,
-                           use_terramind=args.use_terramind)
+                           use_terramind=args.use_terramind,
+                           terramind_fusion=args.terramind_fusion,
+                           cross_modal=args.cross_modal,
+                           cross_modal_local=args.cross_modal_local)
     model = model.to(device)
     print(f"   >> params: {sum(p.numel() for p in model.parameters())/1e6:.2f}M"
           f"  (height_bridge={'off' if args.no_height_bridge else 'on'})")
@@ -805,6 +833,9 @@ def train_7a(args):
                              tversky_beta=args.tversky_beta,
                              focal_tversky_gamma=args.focal_tversky_gamma,
                              building_overlap_weight=args.building_overlap_weight,
+                             decouple_height=args.decouple_height,
+                             build_height_weight=args.build_height_weight,
+                             veg_height_weight=args.veg_height_weight,
                              dice_k=args.dice_k).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)

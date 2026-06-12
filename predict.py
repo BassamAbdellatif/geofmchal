@@ -588,6 +588,9 @@ def predict_7a(args, exp_dir, params):
     fraction_head = params.get("FRACTION_HEAD", "sigmoid3").strip()
     model_type = params.get("MODEL_TYPE", "dual_enc_dec_fusion").strip()
     use_terramind = params.get("USE_TERRAMIND", "True").strip().lower() != "false"
+    terramind_fusion = params.get("TERRAMIND_FUSION", "add").strip()
+    cross_modal = params.get("CROSS_MODAL", "off").strip()
+    cross_modal_local = params.get("CROSS_MODAL_LOCAL", "False").strip().lower() == "true"
     use_thor = any(p.startswith("thor") for p in patch_names)
 
     model, _ = build_model(model_type, n_channels=64, n_classes=4,
@@ -600,7 +603,10 @@ def predict_7a(args, exp_dir, params):
                            fraction_bridge_alpha=fraction_bridge_alpha,
                            fraction_head=fraction_head,
                            bridge_alpha=height_bridge_alpha,
-                           use_terramind=use_terramind)
+                           use_terramind=use_terramind,
+                           terramind_fusion=terramind_fusion,
+                           cross_modal=cross_modal,
+                           cross_modal_local=cross_modal_local)
     model = model.to(device)
     state = torch.load(model_path, map_location=device)
     state = _remap_legacy_7a_state_dict(state, model)
