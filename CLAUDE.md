@@ -17,23 +17,24 @@ score = 0.25×IoU_B + 0.15×IoU_V + 0.15×IoU_W
 - IoU is hard binary at threshold 0.5 on abundance predictions.
 - The proxy in train.py uses C=4.0 (close enough; do not change without rerunning all proxy comparisons).
 
-## Our Current Platform Metrics (best submission: `11_fresh_f1` = 0.4125, rank 43 — 2026-06-11)
-| Metric   | Us (`11_fresh_f1`) | prev (hybrid) | #1 leader | room-to-max (×weight) |
-|----------|--------------------|---------------|-----------|-----------------------|
-| final    | **0.4125**         | 0.3871        | 0.5448    | —                     |
-| IoU_B    | 0.4297             | 0.3511        | 0.5316    | 0.143                 |
-| IoU_V    | 0.8062             | 0.7949        | 0.8924    | 0.029 (near-max ✅)    |
-| IoU_W    | 0.4797             | 0.4544        | 0.6141    | 0.078                 |
-| RMSE_B   | 2.226m             | 2.28m         | 1.83m     | 0.139 (near-top ✅)    |
-| RMSE_V   | **3.807m**         | 3.70m         | 2.78m     | **0.190 🔴 the giant** |
+## Our Current Platform Metrics (best submission: `12_dech_f1` = 0.4277, rank 39 — 2026-06-12)
+| Metric   | Us (`12_dech_f1`) | prev (`11_fresh_f1`) | #1 leader | room-to-max (×weight) |
+|----------|-------------------|----------------------|-----------|-----------------------|
+| final    | **0.4277**        | 0.4125               | 0.5448    | —                     |
+| IoU_B    | 0.4272            | 0.4297               | 0.5316    | **0.143** (stuck)     |
+| IoU_V    | 0.8062            | 0.8062               | 0.8924    | 0.029 (near-max ✅)    |
+| IoU_W    | 0.4844            | 0.4797               | 0.6141    | 0.078                 |
+| RMSE_B   | 2.078m            | 2.226m               | 1.83m     | 0.120 (near-top ✅)    |
+| RMSE_V   | **3.740m**        | 3.807m               | 2.78m     | **0.187 🔴 still the giant** |
 
-> **State (2026-06-11):** best = `11_fresh_f1` (`fresh_extract`: deep dual pixel encoders + symmetric
-> multi-scale fusion + own height head, sm4tv objective, no-TerraMind, single self-contained model,
-> geo-folds {0,2,3,4}/val f1) = **0.4125, rank 43** (up from 54). The capacity swing **broke the old
-> "intrinsic IoU_B ceiling"** (0.35→0.43; RMSE_B now near-top). **Remaining gap is concentrated in
-> RMSE_veg** (3.81 m → 0.010 of a possible 0.20 = 0.190 unrealized). Veg location is solved (IoU_V
-> 0.806); veg *height* is not — and it was self-inflicted (`veg_height_boost=0`, old-7A height weight
-> 0.64). **Active plan: `docs/phase12_height.md` (height-first).** No calibration/TTA (TTA raises RMSE_V).
+> **State (2026-06-12):** best = `12_dech_f1` (`fresh_extract` + **decoupled height loss**: separate,
+> independently-weighted Huber for building vs veg pixels, wb=1/wv=3; sm4tv, no-TerraMind, cv-fold 1) =
+> **0.4277, rank 39** (up from 43/47). The height campaign delivered: **both height metrics dropped on the
+> platform** (RMSE_B −0.148, RMSE_V −0.067), *more* than internal val predicted — decoupling fixed the
+> veg↔building trade (raw `veg_height_boost` washed out, f37) AND helped the train→test gap. **Building
+> height now protected → push veg weight higher** (decoupled wv sweep in flight). Remaining levers:
+> **RMSE_V (0.187 room, tractable)** and **IoU_B (0.143, stuck across every fusion/objective experiment)**.
+> Parked: TerraMind (f36) & alpha↔tessera cross-modal (f38) both net-null. No calibration/TTA.
 > **Incremental tuning is exhausted** (Phase 8 null / Phase 9 small / Phase 10 gradient-bridge null, f33) and the **decoder is already full-resolution** (f34) — so the "raise-resolution / light-U-Net" lever is not available. Remaining step-change candidates (capacity/ensemble/better-height) are uncertain; **top-3 is out of reach in the remaining days.** Full detail: `docs/results.md` f29–f34, `docs/roadmap_final21d.md` status update.
 
 ## Task Description (critical)

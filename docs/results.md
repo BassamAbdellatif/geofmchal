@@ -857,4 +857,20 @@ Both cv-fold-1, 40 ep, vs `11_fresh_f1` baseline (best-proxy epochs, internal fo
   default). Fallbacks if ever revisited: windowed-fine attention or Mamba fusion (not pursued).
 
 **Phase-12 height campaign verdict:** the lever was always RMSE_V, and the win came from *decoupling*
-(not raw boosting). `12_dech_f1` is the new best internal (0.4599); awaiting platform confirmation.
+(not raw boosting). `12_dech_f1` is the new best internal (0.4599).
+
+**PLATFORM CONFIRMED (2026-06-12): `12_dech_f1` = 0.4277, rank 39** (up from 43/47), vs `11_fresh_f1`
+0.4125 → **+0.0152**. Both height metrics dropped, *more than internal val predicted*:
+
+| metric | `11_fresh_f1` | `12_dech_f1` | Δ (platform) | Δ (internal) |
+|--------|---------------|--------------|--------------|--------------|
+| final | 0.4125 | **0.4277** | +0.0152 | +0.0083 |
+| RMSE_build | 2.226 | **2.078** | −0.148 | −0.042 |
+| RMSE_veg | 3.807 | **3.740** | −0.067 | −0.016 |
+| IoU_water | 0.4797 | 0.4844 | +0.0047 | +0.041 |
+| IoU_build | 0.4297 | 0.4272 | −0.0025 | −0.006 |
+
+Decoupling helped the **train→test generalization gap** on height (platform gains > internal). Building
+height now protected → **veg-weight sweep launched** (decoupled, cv-fold 1): `12_dech_wb1wv5` (wb1/wv5),
+`12_dech_wb2wv5` (wb2/wv5), `12_dech_wb2wv3` (wb2/wv3) — push RMSE_V (and RMSE_B) further now that the
+trade is gone. Remaining levers: RMSE_V (0.187 room, tractable) and IoU_B (0.143, stuck everywhere).
