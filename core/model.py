@@ -988,6 +988,20 @@ class _TokenCrossAttn(nn.Module):
         return x + self.gate * self.proj(out)
 
 
+def _win_part(x, w):
+    """(B,C,H,W) -> (B*nWin, C, w, w) non-overlapping w x w windows."""
+    B, C, H, W = x.shape
+    x = x.reshape(B, C, H // w, w, W // w, w).permute(0, 2, 4, 1, 3, 5).reshape(-1, C, w, w)
+    return x, B
+
+
+def _win_unpart(x, w, H, W, B):
+    """Inverse of _win_part."""
+    C = x.shape[1]
+    x = x.reshape(B, H // w, W // w, C, w, w).permute(0, 3, 1, 4, 2, 5).reshape(B, C, H, W)
+    return x
+
+
 class FreshExtract(nn.Module):
     """
     Deep dual pixel encoders (alpha 64@256, tessera 128@256) at full resolution, with
@@ -1039,6 +1053,16 @@ class FreshExtract(nn.Module):
             self.xmod_t3 = _TokenCrossAttn(c[3], c[3], heads=4, local_bias=cross_modal_local)  # t<-a @32
             self.xmod_a4 = _TokenCrossAttn(c[4], c[4], heads=4, local_bias=cross_modal_local)  # a<-t @16
             self.xmod_t4 = _TokenCrossAttn(c[4], c[4], heads=4, local_bias=cross_modal_local)  # t<-a @16
+        elif cross_modal == "fine":
+            # Windowed bidirectional cross-attention at the FINE levels L1 (128, 20 m/px) and
+            # L2 (64, 40 m/px) — finer than coarse's L3/L4 (80/160 m/px), where building structure
+            # starts to resolve. Attention restricted to wxw windows (Tobler-local + tractable at
+            # high res; L0 256-px would OOM at bs32, reserve for checkpointing if this shows signal).
+            self.cm_window = 8
+            self.xwin_a1 = _TokenCrossAttn(c[1], c[1], heads=4, local_bias=cross_modal_local)  # a<-t @128
+            self.xwin_t1 = _TokenCrossAttn(c[1], c[1], heads=4, local_bias=cross_modal_local)  # t<-a @128
+            self.xwin_a2 = _TokenCrossAttn(c[2], c[2], heads=4, local_bias=cross_modal_local)  # a<-t @64
+            self.xwin_t2 = _TokenCrossAttn(c[2], c[2], heads=4, local_bias=cross_modal_local)  # t<-a @64
         self.fraction_decoder = _PyrDecoder(c)
         self.height_decoder = _PyrDecoder(c)
         nfrac = 4 if fraction_head == "softmax4" else 3
@@ -1067,6 +1091,13 @@ class FreshExtract(nn.Module):
             a3 = self.xmod_a3(aP[3], tP[3]); t3 = self.xmod_t3(tP[3], aP[3])
             a4 = self.xmod_a4(aP[4], tP[4]); t4 = self.xmod_t4(tP[4], aP[4])
             aP[3], tP[3], aP[4], tP[4] = a3, t3, a4, t4
+        elif self.cross_modal == "fine":
+            w = self.cm_window
+            for l, xa, xt in ((1, self.xwin_a1, self.xwin_t1), (2, self.xwin_a2, self.xwin_t2)):
+                H, W = aP[l].shape[-2:]
+                aw, B = _win_part(aP[l], w); tw, _ = _win_part(tP[l], w)
+                aP[l] = _win_unpart(xa(aw, tw), w, H, W, B)
+                tP[l] = _win_unpart(xt(tw, aw), w, H, W, B)
         pyr = [self.fuse[l](torch.cat([aP[l], tP[l]], dim=1)) for l in range(5)]
         pyr_frac = pyr                                   # default: both decoders share one pyramid
         if self.use_terramind and self.patch_inputs:
