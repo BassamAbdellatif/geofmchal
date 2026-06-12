@@ -835,3 +835,26 @@ RMSE_B cost. Build/veg pixels are ~spatially disjoint, so one head fits both whe
 - `12_dech_f1` (node1) — **decoupled height**, build_w=1.0 / veg_w=3.0 (boost veg, hold building).
 - `12_xmodal_f1` (node2) — **alpha↔tessera coarse cross-attention** (`--cross-modal coarse`; Phase 12c,
   the IoU_B/capacity play, orthogonal to height).
+
+### 38. Decoupled height WINS; coarse cross-modal is NULL (2026-06-12)
+Both cv-fold-1, 40 ep, vs `11_fresh_f1` baseline (best-proxy epochs, internal fold-1 val):
+
+| run | proxy | IoU_B | IoU_W | RMSE_B | RMSE_V |
+|-----|-------|-------|-------|--------|--------|
+| `11_fresh_f1` (coupled, vb0) | 0.4516 | 0.3487 | 0.6025 | 1.876 | 3.516 |
+| **`12_dech_f1`** (decoupled wb1/wv3) | **0.4599** | 0.3430 | **0.6438** | **1.834** | **3.500** |
+| `12_xmodal_f1` (cross-modal coarse) | 0.4503 | 0.3486 | 0.6041 | 1.879 | 3.542 |
+
+- **Decoupled height = clean win: +0.0083 proxy**, and it fixes the vboost wash — at its best epoch (33)
+  it beats baseline on **both** RMSE_V (−0.016) **and** RMSE_B (−0.042) at once (decoupling even *improved*
+  building height via its own-normalised gradient), plus IoU_W +0.041. Only give-back: IoU_B −0.006
+  (noise). Improves 3/4 platform-room metrics (RMSE_V, RMSE_B, IoU_W). **Submitted** as `12_dech_f1`
+  (946/946 zip verified). Confirms f37: the shared-head veg/building trade was the problem; separate,
+  independently-normalised height terms remove it.
+- **Coarse alpha↔tessera cross-attention = NULL:** ties baseline (0.4503), **no IoU_B gain** (0.3486 ≈
+  0.3487). Same story as TerraMind (f36) — gated attention nets ~0; the 1×1 fuse + decoders already
+  extract what the two modalities offer at the coarse levels. **Dropped** (`--cross-modal` kept off by
+  default). Fallbacks if ever revisited: windowed-fine attention or Mamba fusion (not pursued).
+
+**Phase-12 height campaign verdict:** the lever was always RMSE_V, and the win came from *decoupling*
+(not raw boosting). `12_dech_f1` is the new best internal (0.4599); awaiting platform confirmation.
