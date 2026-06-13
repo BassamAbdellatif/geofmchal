@@ -230,6 +230,11 @@ def parse_args():
                         help="[Phase 12] Weight on the building-pixel height term (decoupled mode).")
     parser.add_argument("--veg-height-weight", type=float, default=1.0,
                         help="[Phase 12] Weight on the veg-pixel height term (decoupled mode).")
+    parser.add_argument("--height-bins", type=int, default=0,
+                        help="[Phase 13a] >0: adaptive-bin height head (N bins, soft-expectation) + "
+                             "discrete-continuous loss (CE+Huber). 0 = legacy scalar regression.")
+    parser.add_argument("--height-ce-weight", type=float, default=0.1,
+                        help="[Phase 13a] weight on the bin cross-entropy term vs the Huber-on-expectation.")
     parser.add_argument("--cache-dir", type=str, default=None,
                         help="[7A] Directory for the memmap float16 tile cache. If set, "
                              "tiles are preprocessed once and served from the (page-cached) "
@@ -638,7 +643,10 @@ def evaluate_7a(model, val_loader, criterion, device, C=4.0, amp=False,
             frac_prob = torch.softmax(out["fraction"], dim=1)[:, :3]
         else:
             frac_prob = torch.sigmoid(out["fraction"])
-        pred = torch.cat([frac_prob, out["height"]], dim=1)
+        h = out["height"]
+        if h.shape[1] > 1:                      # [Phase 13a] bins -> soft-expectation
+            h = model.expected_height(h)
+        pred = torch.cat([frac_prob, h], dim=1)
         for c in range(3):
             p = pred[:, c] > 0.5
             t = target[:, c] > 0.5
@@ -726,6 +734,8 @@ def train_7a(args):
         f.write(f"DECOUPLE_HEIGHT: {args.decouple_height}\n")
         f.write(f"BUILD_HEIGHT_WEIGHT: {args.build_height_weight}\n")
         f.write(f"VEG_HEIGHT_WEIGHT: {args.veg_height_weight}\n")
+        f.write(f"HEIGHT_BINS: {args.height_bins}\n")
+        f.write(f"HEIGHT_CE_WEIGHT: {args.height_ce_weight}\n")
         f.write(f"CACHE_DIR: {args.cache_dir}\n")
         f.write(f"USE_STRATIFIED_SAMPLER: {args.use_stratified_sampler}\n")
         f.write(f"USE_GRADNORM: {args.use_gradnorm}\n")
@@ -821,7 +831,8 @@ def train_7a(args):
                            use_terramind=args.use_terramind,
                            terramind_fusion=args.terramind_fusion,
                            cross_modal=args.cross_modal,
-                           cross_modal_local=args.cross_modal_local)
+                           cross_modal_local=args.cross_modal_local,
+                           height_bins=args.height_bins)
     model = model.to(device)
     print(f"   >> params: {sum(p.numel() for p in model.parameters())/1e6:.2f}M"
           f"  (height_bridge={'off' if args.no_height_bridge else 'on'})")
@@ -837,6 +848,8 @@ def train_7a(args):
                              decouple_height=args.decouple_height,
                              build_height_weight=args.build_height_weight,
                              veg_height_weight=args.veg_height_weight,
+                             height_bins=args.height_bins,
+                             height_ce_weight=args.height_ce_weight,
                              dice_k=args.dice_k).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)

@@ -507,9 +507,13 @@ def _remap_legacy_7a_state_dict(state, model):
 
 
 def _raw_logits_7a(model, batch):
-    """Forward -> 5-channel raw map [fracB,fracV,fracW, binary, height] (pre-sigmoid)."""
+    """Forward -> raw map [frac..., binary, height] (pre-sigmoid). [Phase 13a] if the height
+    head is binned (N-ch), collapse to the 1-ch soft-expectation so downstream slicing holds."""
     out = model(batch)
-    return torch.cat([out["fraction"], out["binary"], out["height"]], dim=1)
+    h = out["height"]
+    if h.shape[1] > 1:
+        h = model.expected_height(h)
+    return torch.cat([out["fraction"], out["binary"], h], dim=1)
 
 
 def _tta_logits_7a(model, batch):
@@ -591,6 +595,7 @@ def predict_7a(args, exp_dir, params):
     terramind_fusion = params.get("TERRAMIND_FUSION", "add").strip()
     cross_modal = params.get("CROSS_MODAL", "off").strip()
     cross_modal_local = params.get("CROSS_MODAL_LOCAL", "False").strip().lower() == "true"
+    height_bins = int(params.get("HEIGHT_BINS", "0").strip())
     use_thor = any(p.startswith("thor") for p in patch_names)
 
     model, _ = build_model(model_type, n_channels=64, n_classes=4,
@@ -606,7 +611,8 @@ def predict_7a(args, exp_dir, params):
                            use_terramind=use_terramind,
                            terramind_fusion=terramind_fusion,
                            cross_modal=cross_modal,
-                           cross_modal_local=cross_modal_local)
+                           cross_modal_local=cross_modal_local,
+                           height_bins=height_bins)
     model = model.to(device)
     state = torch.load(model_path, map_location=device)
     state = _remap_legacy_7a_state_dict(state, model)

@@ -249,7 +249,8 @@ class DualPathLoss(nn.Module):
                  use_binary=True, fraction_head="sigmoid3", building_overlap="dice",
                  tversky_alpha=0.3, tversky_beta=0.7, focal_tversky_gamma=1.333,
                  building_overlap_weight=1.0, decouple_height=False,
-                 build_height_weight=1.0, veg_height_weight=1.0):
+                 build_height_weight=1.0, veg_height_weight=1.0,
+                 height_bins=0, height_ce_weight=0.1):
         """
         veg_height_boost: extra weight on the masked Huber for vegetation pixels
             (veg_frac > veg_boost_thresh). Default 0.0 reproduces the Phase-4
@@ -279,6 +280,13 @@ class DualPathLoss(nn.Module):
         self.decouple_height = decouple_height
         self.build_height_weight = build_height_weight
         self.veg_height_weight = veg_height_weight
+        # [Phase 13a] Adaptive-bin (discrete-continuous) height loss: CE over N bins +
+        # Huber on the soft-expectation. height_bins=0 => legacy scalar Huber (identical).
+        self.height_bins = height_bins
+        self.height_ce_weight = height_ce_weight
+        if height_bins > 0:
+            centers = (torch.arange(height_bins).float() + 0.5) / height_bins * 1.5
+            self.register_buffer("height_centers", centers)
         self.use_binary = use_binary
         self.fraction_head = fraction_head
         self.building_overlap = building_overlap
@@ -339,7 +347,6 @@ class DualPathLoss(nn.Module):
 
     def forward(self, outputs, target):
         frac_logits = outputs["fraction"]          # (B,3|4,H,W)
-        height_pred = outputs["height"][:, 0]      # (B,H,W)
 
         frac_target = target[:, :3]                # (B,3,H,W) in [0,1]
         height_target = target[:, 3]               # (B,H,W) normalised
@@ -348,9 +355,20 @@ class DualPathLoss(nn.Module):
 
         loss_fraction = self._fraction_loss(frac_logits, frac_target)
 
-        # Height: Huber, masked (building OR veg present) + small bg tail.
-        huber = F.huber_loss(height_pred, height_target, delta=self.huber_delta,
-                             reduction="none")
+        # Per-pixel height loss. [Phase 13a] discrete-continuous when the adaptive-bin head
+        # is on (CE over N bins + Huber on the soft-expectation); else legacy scalar Huber.
+        if self.height_bins > 0:
+            logits_h = outputs["height"]                                   # (B,N,H,W)
+            p = torch.softmax(logits_h, dim=1)
+            E_h = (p * self.height_centers.view(1, -1, 1, 1)).sum(1)       # (B,H,W) exp norm height
+            gt_b = (height_target / 1.5 * self.height_bins).long().clamp(0, self.height_bins - 1)
+            ce = F.cross_entropy(logits_h, gt_b, reduction="none")         # (B,H,W)
+            reg = F.huber_loss(E_h, height_target, delta=self.huber_delta, reduction="none")
+            huber = self.height_ce_weight * ce + reg                       # (B,H,W) per-pixel
+        else:
+            height_pred = outputs["height"][:, 0]                          # (B,H,W)
+            huber = F.huber_loss(height_pred, height_target, delta=self.huber_delta,
+                                 reduction="none")
         if self.decouple_height:
             # [Phase 12] Separate building / veg height terms, each normalised over
             # its own pixel count and independently weighted, so raising the veg

@@ -344,7 +344,8 @@ def build_model(model_type, n_channels, n_classes, use_height_bridge=True,
                 patch_routing="sensor",
                 use_fraction_bridge=False, fraction_bridge_alpha=0.2,
                 fraction_head="sigmoid3", bridge_alpha=0.2, use_terramind=True,
-                terramind_fusion="add", cross_modal="off", cross_modal_local=False):
+                terramind_fusion="add", cross_modal="off", cross_modal_local=False,
+                height_bins=0):
     selected = model_type.lower()
 
     if selected == "auto":
@@ -376,6 +377,7 @@ def build_model(model_type, n_channels, n_classes, use_height_bridge=True,
             terramind_fusion=terramind_fusion,
             cross_modal=cross_modal,
             cross_modal_local=cross_modal_local,
+            height_bins=height_bins,
         ), selected
 
     raise ValueError(
@@ -1017,7 +1019,8 @@ class FreshExtract(nn.Module):
 
     def __init__(self, patch_inputs=("terramind_s1", "terramind_s2"),
                  fraction_head="softmax4", use_terramind=True, patch_stem_version="v1",
-                 terramind_fusion="add", cross_modal="off", cross_modal_local=False):
+                 terramind_fusion="add", cross_modal="off", cross_modal_local=False,
+                 height_bins=0):
         super().__init__()
         c = self.CHANNELS
         self.fraction_head = fraction_head
@@ -1068,7 +1071,14 @@ class FreshExtract(nn.Module):
         nfrac = 4 if fraction_head == "softmax4" else 3
         self.frac_head = nn.Conv2d(c[0], nfrac, 1)
         self.binary_head = nn.Conv2d(c[0], 1, 1)
-        self.height_head = nn.Conv2d(c[0], 1, 1)
+        # [Phase 13a] Adaptive-bin height head: height_bins>0 => predict a distribution over
+        # N height bins (value = soft-expectation); 0 => legacy 1-ch scalar regression.
+        self.height_bins = height_bins
+        self.height_head = nn.Conv2d(c[0], height_bins if height_bins > 0 else 1, 1)
+        if height_bins > 0:
+            # uniform bin centers in normalised-height space [0, 1.5] (= 0..45 m at /30).
+            centers = (torch.arange(height_bins).float() + 0.5) / height_bins * 1.5
+            self.register_buffer("height_centers", centers)
 
     def _tokens_16(self, batch):
         grids = []
@@ -1122,6 +1132,11 @@ class FreshExtract(nn.Module):
                 "height": self.height_head(hfeat),
                 "binary": self.binary_head(ffeat)}
 
+    def expected_height(self, logits):
+        """Bin logits (B,N,H,W) -> (B,1,H,W) normalised soft-expectation height."""
+        p = torch.softmax(logits, dim=1)
+        return (p * self.height_centers.view(1, -1, 1, 1)).sum(1, keepdim=True)
+
     @torch.no_grad()
     def predict(self, batch):
         out = self.forward(batch)
@@ -1129,4 +1144,5 @@ class FreshExtract(nn.Module):
             frac = torch.softmax(out["fraction"], dim=1)[:, :3]
         else:
             frac = torch.sigmoid(out["fraction"])
-        return torch.cat([frac, out["height"]], dim=1)
+        h = self.expected_height(out["height"]) if self.height_bins > 0 else out["height"]
+        return torch.cat([frac, h], dim=1)
