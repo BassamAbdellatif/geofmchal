@@ -11,3 +11,9 @@ nohup.out
 _thor_smoke/*.pt
 _thor_smoke/ref.pt
 data/*.bak
+
+# run logs & operational helpers (not project code)
+*.log
+thermal_guard.sh
+_launch_run.sh
+nohup.out

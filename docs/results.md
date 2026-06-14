@@ -903,3 +903,169 @@ All cv-fold 1, 40 ep, vs `12_dech_f1` (0.4599; submitted, platform 0.4277). Best
 gains nearly exhausted: build-weight=2 marginal; veg maxed; **TerraMind (f36), cross-modal (f38/f39) all
 dead**; IoU_B stuck across every lever (→ embedding-information ceiling at 10 m, not architecture). Next:
 submit `wb2wv5`, then end-stage **multi-fold/seed ensembling** rather than more single-model swings.
+
+---
+
+## Phase 12c — wb2wv5 platform result: the weight-push bet LOST (2026-06-13)
+
+### 40. `12_dech_wb2wv5` = 0.4139 on the platform — REGRESSED vs `12_dech_f1` (0.4277). dech_f1 stays best.
+
+| metric | `12_dech_f1` (best) | `12_dech_wb2wv5` | Δ platform | Δ internal proxy (f39) |
+|--------|---------------------|------------------|-----------|------------------------|
+| **final** | **0.4277** | 0.4139 | **−0.0138** | +0.0027 |
+| IoU_B | 0.4272 | 0.4005 | **−0.0267** | +0.007 |
+| IoU_V | 0.8062 | 0.8048 | −0.0014 | — |
+| IoU_W | 0.4844 | 0.4682 | −0.0162 | +0.011 |
+| RMSE_B | 2.078 | 2.133 | +0.055 | −0.021 |
+| RMSE_V | 3.740 | 3.736 | −0.004 (**flat**) | −0.003 |
+
+- **The bet lost and `12_dech_f1` remains our best submission.** The internal proxy gain (+0.0027) was
+  **anti-correlated** with the platform (−0.0138) — the ±0.005 noise-band caveat f39 itself flagged, now
+  confirmed the hard way. `wb2wv5` is **abandoned** (do not resubmit; predictions kept, not promoted).
+- **Lesson — single-fold internal IoU does NOT predict platform IoU direction.** Internal said IoU_B +0.007 /
+  IoU_W +0.011; platform delivered −0.027 / −0.016. IoU_B is fragile to *any* shift in the height-loss
+  balance (raising build/veg height weight perturbs the shared-encoder gradient → IoU regresses on the
+  shifted test set). Only RMSE transferred reliably for dech (f38), and only *decoupling itself* — not
+  pushing the weights past wb1/wv3 — was a real win. **wb1/wv3 (dech_f1) is the edge; further weight-pushing
+  is over it.**
+- **Lesson — reweighting the height loss cannot move RMSE_V.** Three independent confirmations now: vboost
+  wash (f37), internal veg>3 null (f39), and platform wv3→wv5 flat (this entry, 3.740→3.736). RMSE_V is
+  **stuck ~3.74 regardless of how we weight the height term.** → This is the definitive case for **Phase 13a
+  (adaptive-bin / discrete-continuous height head)**: it attacks RMSE_V by *reformulating the head*
+  (classification-into-bins + expectation = sharper distribution), the one mechanism we have NOT tried,
+  rather than the reweighting lever that is now exhausted.
+
+**Implication for Phase 13a screening:** the binned loss inflates the per-pixel height magnitude ~5–9× over
+the legacy scalar Huber (smoke, 2026-06-13) — structurally similar to the height-weight push that just cost
+IoU on the platform. So (a) favour **lower ce_weight** to keep the height magnitude near legacy, (b) treat
+**IoU as the primary risk-guard**, and (c) given single-fold IoU is platform-blind, only promote a Phase-13a
+variant to the platform on a **real RMSE_V drop with IoU held flat internally** — and accept the platform is
+the final arbiter (spend submission slots judiciously).
+
+---
+
+## Phase 13a — Adaptive-bin height head: WORKS at full data (2026-06-13)
+
+### 41. Binned (discrete-continuous) height head lowers RMSE_V; gain scales with `ce_weight`. Fast screen was underfit-misleading.
+
+**Setup:** `fresh_extract` + decoupled wb1/wv3 (the `dech_f1` recipe), only change = `--height-bins 128`
+(uniform, soft-expectation) + discrete-continuous loss `ce_weight·CE + Huber(E_h)`. Full cv-fold-1, 40 ep,
+`--num-workers 4`, AMP, no-gradnorm. ce_weight swept 0.03/0.05/0.10/0.20 (one per node). All four clean
+(40 ep, single footer). vs `dech_f1` (no-bin): proxy 0.4599 / RMSE_V 3.500 / RMSE_B 1.834 / IoU_B 0.343.
+
+| run | best proxy | IoU_B | IoU_W | RMSE_B | RMSE_V (best-proxy) | **min RMSE_V** (@ep21) |
+|-----|-----------|-------|-------|--------|---------------------|------------------------|
+| `dech_f1` (no-bin) | 0.4599 | 0.343 | 0.644 | 1.834 | 3.500 | ~3.49 |
+| `13_bins128_ce03_f1` | 0.4506 | 0.343 | 0.601 | 1.816 | 3.577 | 3.480 |
+| `13_bins128_ce05_f1` | 0.4543 | 0.346 | 0.614 | 1.823 | 3.555 | 3.476 |
+| `13_bins128_ce10_f1` | 0.4593 | 0.350 | 0.680 | 1.897 | 3.574 | 3.425 |
+| **`13_bins128_ce20_f1`** | 0.4586 | 0.345 | 0.599 | **1.787** | **3.465** | **3.413** |
+
+- **Binning works at full data — the first lever to actually move RMSE_V** (reweighting never did: f37/f39/f40
+  stuck ~3.74 platform). min-RMSE_V drops monotonically with ce: 3.480→3.476→3.425→3.413. **`ce20` deployable
+  (proxy-best) checkpoint beats `dech_f1` on BOTH height metrics** (RMSE_V 3.465<3.500, RMSE_B 1.787<1.834),
+  IoU_B held (0.345). This is the discrete-continuous mechanism working: more CE-sharpening → sharper height.
+- **The fast screen (f-screen, train fold0/30ep) was UNDERFIT-BIASED against binning** — it showed ce05
+  RMSE_V 4.894 (disaster); at full data ce05 = 3.555. The 128-way classification head is more data-hungry
+  than scalar regression, so the underfit screen penalised it disproportionately (the f29 lesson, this time
+  cutting against the new method). **Lesson: do NOT fast-screen a head-capacity change on a tiny fold — go
+  straight to one full cv-fold run.**
+- **IoU_W wobble (0.599–0.680) is per-epoch fold noise, not a binning penalty** (ce10's proxy-peak epoch
+  landed on IoU_W 0.680; ce20's on 0.599). RMSE_B/RMSE_V are the reliable-transferring metrics (f38).
+- **min RMSE_V is at ep21 for ALL runs, before best-proxy (ep25–34)** — height peaks early then trades for
+  IoU as training continues (multi-task). Deployed proxy-best checkpoint sacrifices ~0.05 m RMSE_V for IoU.
+
+**Next:** ce trend is monotone-improving → push higher (ce 0.30/0.40/0.60) + one N=256 probe to find the
+height optimum and where IoU cost bites. `ce20` is the current submit candidate (height gain is the
+transfer-reliable kind; submission slot opens ~midnight 06-14).
+
+### 42. Extended ce-sweep + N=256: height saturates ~ce30–40; N=256 is the best balance (2026-06-14)
+Full cv-fold-1, 40 ep, num-workers 4. ce 0.30/0.40/0.60 at N=128/batch32; one N=256/ce0.20/batch24 probe.
+
+| run | proxy | IoU_B | IoU_W | RMSE_B | RMSE_V(bp) | min RMSE_V |
+|-----|-------|-------|-------|--------|-----------|------------|
+| `dech_f1` (no-bin) | 0.4599 | 0.343 | **0.644** | 1.834 | 3.500 | ~3.49 |
+| ce03 | 0.4506 | 0.343 | 0.601 | 1.816 | 3.577 | 3.480 |
+| ce05 | 0.4543 | 0.346 | 0.614 | 1.823 | 3.555 | 3.476 |
+| ce10 | 0.4593 | 0.350 | 0.680 | 1.897 | 3.574 | 3.425 |
+| ce20 | 0.4586 | 0.345 | 0.599 | 1.787 | 3.465 | 3.413 |
+| ce30 | 0.4559 | 0.346 | 0.571 | 1.784 | 3.438 | 3.402 |
+| ce40 | 0.4550 | 0.344 | 0.581 | 1.802 | 3.457 | **3.394** |
+| ce60 | 0.4587 | 0.345 | 0.599 | 1.812 | 3.424 | 3.398 |
+| **`13_bins256_ce20_b24_f1`** | **0.4608** | 0.344 | 0.616 | 1.798 | 3.453 | 3.412 |
+
+- **min-RMSE_V saturates ~ce30–40** (3.480→3.394, plateau past ce30). All 8 binned runs beat `dech_f1`'s
+  ~3.49 by 0.07–0.10 → the RMSE_V lever is **robust (8/8), the first real mover** (reweighting never did).
+- **Cost = IoU_W** (~0.57–0.62 vs 0.644), grows with ce; IoU_B holds (~0.345) throughout.
+- **N=256/ce0.20 is the best overall balance:** highest proxy of all (**0.4608, the only run > `dech_f1`**),
+  keeps the height gain (RMSE_B 1.798 / min-RMSE_V 3.412) AND holds IoU_W best (0.616). Finer bins buy the
+  sharpening with less shared-encoder distributional cost. **→ leading submit candidate.**
+- **Batch-24 did NOT hurt IoU_W** (bins256_b24 IoU_W 0.616 > the batch-32 high-ce runs' 0.57–0.60) →
+  empirical refutation of the f23 batch≥32-for-water claim (already annotated as confounded in CLAUDE.md).
+- **Caveat (f40):** proxy edge of bins256 over `dech_f1` is tiny (+0.0009, within noise). The reliable part
+  is RMSE_V/RMSE_B (transfer-amplified, f38); the IoU_W give-back may or may not transfer. A marginal
+  single-fold proxy win is exactly what burned us at wb2wv5 — so submission of bins256 is a bet that the
+  reliable height gain outweighs the noisy IoU_W give-back on the test set.
+
+**Next options:** (a) submit `bins256_ce20_b24` now to anchor whether the binning RMSE_V gain transfers
+(P0-style de-risk; slot open ~05:42); or (b) one more run — **N=256 at ce0.30** (finer bins + height-optimal
+ce, the IoU_W-friendlier axis) — to chase a clearer-than-noise proxy win before spending the slot.
+
+### 43. PLATFORM: binning WINS — `13_bins256_ce20_b24_f1` = 0.4379, rank 31 (from 39). RMSE_V moved for the first time. (2026-06-14)
+Submitted bins256_ce20_b24 (chose option a). New best, +0.0102 over `12_dech_f1` (0.4277), **rank 39→31**.
+
+| metric | `12_dech_f1` | **`13_bins256_ce20_b24`** | Δ platform | Δ internal | platform amplification |
+|--------|--------------|---------------------------|-----------|-----------|------------------------|
+| final | 0.4277 | **0.4379** | +0.0102 | +0.0009 | — |
+| IoU_B | 0.4272 | 0.4123 | **−0.0149** | +0.001 | (regressed on test only) |
+| IoU_V | 0.8062 | 0.8053 | −0.0009 | — | — |
+| IoU_W | 0.4844 | 0.4850 | +0.0006 | (−0.028 int) | **give-back was fold noise → did NOT transfer** |
+| RMSE_B | 2.078 | **1.973** | −0.105 | −0.036 | **~2.9×** |
+| RMSE_V | 3.740 | **3.606** | −0.134 | −0.047 | **~2.9×** |
+
+- **Binning is a confirmed platform win.** RMSE_V moved **for the first time in the whole campaign**
+  (−0.134) — reweighting NEVER did (f37/f39/f40). The discrete-continuous head reformulation was the right
+  mechanism. Score math: height (RMSE_V 0.20·0.134/3.9 + RMSE_B 0.25·0.105/3.9) = +0.0136, IoU_B
+  −0.25·0.0149 = −0.0037 → net **+0.0099 ≈ +0.0102** ✓.
+- **Height gains amplify ~2.9× on the platform** (internal −0.047 → platform −0.134), matching the f38
+  height-transfer factor. **So internal RMSE_V improvements are high-leverage — keep pushing the head.**
+- **The internal IoU_W give-back (−0.028) was fold noise — did NOT transfer** (platform +0.0006). Confirms
+  picking the N=256 candidate and the "IoU_W per-epoch wobble = noise" read (f41/f42).
+- **One real cost: IoU_B −0.015** (held internally at 0.344, dropped to 0.412 on test). The binned height
+  loss's larger magnitude (~5–9× the scalar Huber) likely shifted shared-encoder gradient toward height,
+  away from buildings. This is the f40 single-fold-IoU caveat again — now on IoU_B. **If we can keep the
+  height win without the IoU_B hit, there's another +0.015 on the table.**
+- **Batch-24 confirmed harmless** (IoU_W held on platform) → f23 batch≥32 fear fully retired.
+
+**State:** new best `13_bins256_ce20_b24_f1` = **0.4379, rank 31**. RMSE_V 3.740→3.606 (room to #1's 2.78
+still 0.042·wt); IoU_B regressed to 0.412 (now a bigger deficit vs #1's 0.532). Next slot ~21:08 06-14.
+
+### 44. PLATFORM: `13_bins256_ce40_b24_f1` = 0.4413, rank 30 (from 31). Height lever still paying, now saturating. (2026-06-14)
+ce40 (N=256, height_ce_weight 0.40, batch24) submitted. New best, +0.0034 over `bins256_ce20` (0.4379).
+
+| metric | `bins256_ce20` | **`ce40`** | Δ | internal (ce40 deployed) |
+|--------|----------------|------------|---|--------------------------|
+| final | 0.4379 | **0.4413** | +0.0034 | proxy 0.4658 |
+| IoU_B | 0.4123 | **0.4199** | +0.0076 | 0.344 (tied internally — recovered on test) |
+| IoU_V | 0.8053 | 0.8041 | −0.0012 | 0.781 |
+| IoU_W | 0.4850 | 0.4841 | −0.0009 | 0.635 |
+| RMSE_B | 1.9733 | 1.9718 | −0.0015 | 1.782 |
+| RMSE_V | 3.6064 | **3.5636** | −0.0428 | 3.427 (min 3.364) |
+
+- **RMSE_V keeps transferring** (3.740 dech → 3.606 ce20 → 3.564 ce40 across the binning campaign). Score
+  math: RMSE_V +0.0022 + IoU_B +0.0019 ≈ +0.0034 ✓. **IoU_B did NOT regress further** — it recovered
+  +0.0076 (the higher-ce model generalised buildings slightly better on test, despite tied internal IoU_B).
+- **The lever is saturating.** ce20→ce40 internal min-RMSE_V only went 3.412→3.364, and platform only
+  +0.0034. Further ce/N pushing is diminishing — binning has largely extracted the height signal available
+  in the 10 m embeddings. RMSE_V 3.564 is still above #1's 2.78, but that residual is likely embedding-limit,
+  not method.
+- **Campaign arc:** rank 54 (`2A_vegboost` 0.3721) → 43 (`11_fresh` capacity swing 0.4125) → 39
+  (`12_dech` decoupled height 0.4277) → 31 (`bins256_ce20` adaptive-bin 0.4379) → **30 (`ce40` 0.4413)**.
+  The two step-changes were architecture capacity (f35) and height-via-binning (f41–f44).
+
+**Honest read on top-3:** #1 = 0.5448; we're 0.4413. Gap +0.10 = unrealized: RMSE_V 0.040 (binning near
+ceiling), IoU_B 0.028 (stuck all campaign), IoU_W 0.020. Remaining levers (multi-seed/fold **ensemble** of
+ce40 ≈ +0.005–0.01; the untried **ce40+building-overlap** combo for IoU_B; bo2/bo3 already ≈null on IoU_B
+internally) are incremental — realistically worth ~+0.01–0.02 → high-20s rank, **top-3 (needs +0.08) not
+reachable** with these levers in the remaining days. The leaders' gap is most likely structural
+(better embeddings/extraction), not tuning. Best-honest-rank mode from here.

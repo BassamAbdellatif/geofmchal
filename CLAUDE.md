@@ -17,25 +17,36 @@ score = 0.25×IoU_B + 0.15×IoU_V + 0.15×IoU_W
 - IoU is hard binary at threshold 0.5 on abundance predictions.
 - The proxy in train.py uses C=4.0 (close enough; do not change without rerunning all proxy comparisons).
 
-## Our Current Platform Metrics (best submission: `12_dech_f1` = 0.4277, rank 39 — 2026-06-12)
-| Metric   | Us (`12_dech_f1`) | prev (`11_fresh_f1`) | #1 leader | room-to-max (×weight) |
-|----------|-------------------|----------------------|-----------|-----------------------|
-| final    | **0.4277**        | 0.4125               | 0.5448    | —                     |
-| IoU_B    | 0.4272            | 0.4297               | 0.5316    | **0.143** (stuck)     |
-| IoU_V    | 0.8062            | 0.8062               | 0.8924    | 0.029 (near-max ✅)    |
-| IoU_W    | 0.4844            | 0.4797               | 0.6141    | 0.078                 |
-| RMSE_B   | 2.078m            | 2.226m               | 1.83m     | 0.120 (near-top ✅)    |
-| RMSE_V   | **3.740m**        | 3.807m               | 2.78m     | **0.187 🔴 still the giant** |
+## Our Current Platform Metrics (best submission: `13_bins256_ce40_b24_f1` = 0.4413, rank 30 — 2026-06-14)
+Unrealized-score = weight × normalized gap to #1 (RMSE normalized by 3.9). Total room to #1 = 0.103.
+| Metric   | Us (`ce40`) | prev (`bins256_ce20`) | #1 leader | unrealized score |
+|----------|-------------|-----------------------|-----------|------------------|
+| final    | **0.4413**  | 0.4379                | 0.5448    | 0.103            |
+| IoU_B    | 0.4199      | 0.4123                | 0.5316    | **0.028 (recovered slightly; still stuck/2nd-biggest)** |
+| IoU_V    | 0.8041      | 0.8053                | 0.8924    | 0.013 (near-max ✅) |
+| IoU_W    | 0.4841      | 0.4850                | 0.6141    | 0.020            |
+| RMSE_B   | **1.972m**  | 1.973m                | 1.83m     | 0.009 (near-top ✅) |
+| RMSE_V   | **3.564m**  | 3.606m                | 2.78m     | **0.040 (largest single; binning near ceiling)** |
 
-> **State (2026-06-12):** best = `12_dech_f1` (`fresh_extract` + **decoupled height loss**: separate,
-> independently-weighted Huber for building vs veg pixels, wb=1/wv=3; sm4tv, no-TerraMind, cv-fold 1) =
-> **0.4277, rank 39** (up from 43/47). The height campaign delivered: **both height metrics dropped on the
-> platform** (RMSE_B −0.148, RMSE_V −0.067), *more* than internal val predicted — decoupling fixed the
-> veg↔building trade (raw `veg_height_boost` washed out, f37) AND helped the train→test gap. **Building
-> height now protected → push veg weight higher** (decoupled wv sweep in flight). Remaining levers:
-> **RMSE_V (0.187 room, tractable)** and **IoU_B (0.143, stuck across every fusion/objective experiment)**.
-> Parked: TerraMind (f36) & alpha↔tessera cross-modal (f38) both net-null. No calibration/TTA.
-> **Incremental tuning is exhausted** (Phase 8 null / Phase 9 small / Phase 10 gradient-bridge null, f33) and the **decoder is already full-resolution** (f34) — so the "raise-resolution / light-U-Net" lever is not available. Remaining step-change candidates (capacity/ensemble/better-height) are uncertain; **top-3 is out of reach in the remaining days.** Full detail: `docs/results.md` f29–f34, `docs/roadmap_final21d.md` status update.
+> **State (2026-06-14): NEW BEST `13_bins256_ce40_b24_f1` = 0.4413, rank 30** (from 39 → 31 → 30). The
+> **adaptive-bin (discrete-continuous) height head (Phase 13a, f41–f44)** was the breakthrough: it **moved
+> RMSE_V for the first time in the whole campaign** (3.740→3.564) — reweighting never could (f37/f39/f40).
+> Recipe = `dech_f1` + `--height-bins 256 --height-ce-weight 0.4` (N=256 uniform bins, soft-expectation,
+> CE+Huber loss; batch 24, `expandable_segments`). ce40 also *recovered* IoU_B +0.0076 on test (didn't
+> regress). **The height lever is now SATURATING** (ce20→ce40 only +0.0034 platform; internal min-RMSE_V
+> 3.412→3.364) — binning has largely extracted the height signal in the 10 m embeddings.
+> **Honest read (f44): top-3 (0.5448, needs +0.10) is out of reach** — remaining levers (multi-seed/fold
+> **ensemble** of ce40 ≈+0.005–0.01; untried **ce40+building-overlap** combo for IoU_B) are incremental,
+> ~+0.01–0.02 → high-20s. IoU_B (0.028) and IoU_W (0.020) are the residual room; both have resisted tuning.
+> Best-honest-rank mode. Deadline 2026-06-30. Packaged-but-unsubmitted: bo2/bo3 (≈null on IoU_B internally).
+
+> **Prior context (superseded best pointers):** `12_dech_f1` (decoupled height, wb1/wv3) = 0.4277 rank 39
+> was the prior best; its weight-push follow-up `wb2wv5` FAILED on platform (f40, −0.0138, proxy
+> anti-correlated → reweighting can't move RMSE_V). **Parked dead-ends:** TerraMind (f36), alpha↔tessera
+> cross-modal both resolutions (f38/f39), GradNorm/Rotograd (f26), threshold-calibration/TTA (excluded —
+> won't transfer / TTA hurts). **Exhausted:** incremental tuning (Phase 8 null / 9 small / 10 null, f33);
+> decoder is already full-resolution (f34) so "raise-resolution / light-U-Net" is unavailable. Full detail:
+> `docs/results.md` f29–f43, `docs/roadmap_final21d.md`.
 
 ## Task Description (critical)
 - Targets are **abundance fractions** (0–1), computed from 1m-resolution binary masks
@@ -124,6 +135,6 @@ cd /mnt/head/users/bassam/src/geofmchal
 - **GradScale α=0.1** on the height decoder helps but is not sufficient on its own to prevent task interference.
 - **Random validation splits leak spatial context.** 7A switches to geographic CV (KMeans over lat/lon) because the test set is in different regions and years.
 - **THOR adds nothing to 7A** (Phase 5D, f22): single-stream ties the base, full-stream collapses water. Dropped.
-- **Rare-class (water) ignition is fragile** (f23–24): it needs the simple **v1** patch stem + **batch ≥ 32** + ≤3 patch streams. The deeper v2/v2b stem, batch 24, or full-THOR each independently zero IoU_W for all 60 epochs (dead at every threshold down to 0.05 — not a calibration artifact). Building survives via its dedicated binary head; water has none → root cause is weak rare-class supervision.
+- **Rare-class (water) ignition is fragile** (f23–24): it needs the simple **v1** patch stem + ≤3 patch streams. The deeper v2/v2b stem or full-THOR each independently zero IoU_W for all 60 epochs (dead at every threshold down to 0.05 — not a calibration artifact). Building survives via its dedicated binary head; water has none → root cause is weak rare-class supervision. **CAVEAT (re-examined 2026-06-13):** the original "batch ≥ 32 required" part of this claim is **weak/confounded** — those ablations predate the **unseeded-aug fix (f25)**, so the batch-24 vs batch-32 runs had different effective aug/sampling draws; zero-IoU_W is the signature of **seed-fragile bistable ignition**, not a proven batch-size law (no sharp threshold predicted by theory, and our stratified sampler already oversamples water). On `fresh_extract` this was **never** retested. So treat batch<32 as a low/uncertain risk to verify post-hoc (glance at IoU_W), **not** a hard rule; the real reason to hold batch 32 is **comparability** with the batch-32 baselines (`dech_f1`, Phase-13a), not water fear.
 - **Augmentation RNG is unseeded** (f25): `np.random.default_rng()` in the dataset ignores `--seed`; seed it before trusting fine ablations.
 - **Don't tune inference thresholds / blend-binary to fold-0 val** — fit to that fold's distribution, won't transfer to the different-region/year test set. Depend on the raw prediction at 0.5.
