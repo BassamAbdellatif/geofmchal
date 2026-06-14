@@ -235,6 +235,9 @@ def parse_args():
                              "discrete-continuous loss (CE+Huber). 0 = legacy scalar regression.")
     parser.add_argument("--height-ce-weight", type=float, default=0.1,
                         help="[Phase 13a] weight on the bin cross-entropy term vs the Huber-on-expectation.")
+    parser.add_argument("--domain-aug-scale", type=float, default=1.0,
+                        help="[Phase 14] embedding domain-shift augmentation strength (train only): "
+                             "1.0 = legacy magnitudes (byte-identical), 0 = OFF (no-aug baseline), >1 stronger.")
     parser.add_argument("--cache-dir", type=str, default=None,
                         help="[7A] Directory for the memmap float16 tile cache. If set, "
                              "tiles are preprocessed once and served from the (page-cached) "
@@ -736,6 +739,7 @@ def train_7a(args):
         f.write(f"VEG_HEIGHT_WEIGHT: {args.veg_height_weight}\n")
         f.write(f"HEIGHT_BINS: {args.height_bins}\n")
         f.write(f"HEIGHT_CE_WEIGHT: {args.height_ce_weight}\n")
+        f.write(f"DOMAIN_AUG_SCALE: {args.domain_aug_scale}\n")
         f.write(f"CACHE_DIR: {args.cache_dir}\n")
         f.write(f"USE_STRATIFIED_SAMPLER: {args.use_stratified_sampler}\n")
         f.write(f"USE_GRADNORM: {args.use_gradnorm}\n")
@@ -780,7 +784,8 @@ def train_7a(args):
     tiles = find_multimodal_train_tiles(DATA_ROOT_7A, use_thor=use_thor)
     train_ds = GeoFMDataset7A(tiles, is_train=True, cv_fold=args.cv_fold,
                               cache_dir=args.cache_dir, rebuild_cache=args.rebuild_cache,
-                              patch_inputs=patch_names, include_folds=tr_inc)
+                              patch_inputs=patch_names, include_folds=tr_inc,
+                              domain_aug_scale=args.domain_aug_scale)
     if fast:
         val_ds = (GeoFMDataset7A(tiles, is_train=False, cache_dir=args.cache_dir,
                                  rebuild_cache=args.rebuild_cache, patch_inputs=patch_names,

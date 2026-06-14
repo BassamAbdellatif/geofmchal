@@ -311,27 +311,34 @@ def _apply_norm(arr, mean, std, channel_axis=0):
     return (arr - mean) / std
 
 
-def augment_domain_shift(emb_dict, norm_stats, rng):
+def augment_domain_shift(emb_dict, norm_stats, rng, scale=1.0):
     """
-    Embedding-space domain-shift augmentation (training only).
-    Pixel streams: channel gain [0.9,1.1], offset [-0.1,0.1], channel dropout p=0.1,
-                   Gaussian noise σ = 0.05 × per-channel std.
+    Embedding-space domain-shift augmentation (training only). [Phase 14] `scale` multiplies
+    all perturbation magnitudes: scale=1.0 == legacy behavior (byte-identical RNG draws),
+    scale=0 disables it entirely (true no-aug baseline; consumes no RNG), scale>1 = stronger.
+    Pixel streams: channel gain [1±0.1·s], offset [±0.1·s], channel dropout p=0.1·s,
+                   Gaussian noise σ = 0.05·s × per-channel std.
     Patch tokens: gain + dropout only.
     """
+    if scale <= 0:
+        return emb_dict
+    g = o = 0.1 * scale
+    p_drop = min(0.1 * scale, 0.95)
+    n_fac = 0.05 * scale
     for key in ("alpha_earth", "tessera"):
         if key not in emb_dict:
             continue
         emb = emb_dict[key]          # (C, H, W) float32
         C = emb.shape[0]
         if rng.random() < 0.5:
-            gain   = rng.uniform(0.9, 1.1, size=(C, 1, 1)).astype(np.float32)
-            offset = rng.uniform(-0.1, 0.1, size=(C, 1, 1)).astype(np.float32)
+            gain   = rng.uniform(1.0 - g, 1.0 + g, size=(C, 1, 1)).astype(np.float32)
+            offset = rng.uniform(-o, o, size=(C, 1, 1)).astype(np.float32)
             emb = emb * gain + offset
-        drop_mask = (rng.random(size=(C, 1, 1)) > 0.1).astype(np.float32)
+        drop_mask = (rng.random(size=(C, 1, 1)) > p_drop).astype(np.float32)
         emb = emb * drop_mask
         if rng.random() < 0.5 and norm_stats and key in norm_stats:
             std_per_ch = np.array(norm_stats[key]["std"], dtype=np.float32).reshape(C, 1, 1)
-            noise = rng.normal(0, 0.05 * std_per_ch, size=emb.shape).astype(np.float32)
+            noise = rng.normal(0, n_fac * std_per_ch, size=emb.shape).astype(np.float32)
             emb = emb + noise
         emb_dict[key] = emb
 
@@ -341,9 +348,9 @@ def augment_domain_shift(emb_dict, norm_stats, rng):
         emb = emb_dict[key]          # (N, D) float32  N=256, D=768
         D = emb.shape[1]
         if rng.random() < 0.5:
-            gain = rng.uniform(0.9, 1.1, size=(1, D)).astype(np.float32)
+            gain = rng.uniform(1.0 - g, 1.0 + g, size=(1, D)).astype(np.float32)
             emb = emb * gain
-        drop_mask = (rng.random(size=(1, D)) > 0.1).astype(np.float32)
+        drop_mask = (rng.random(size=(1, D)) > p_drop).astype(np.float32)
         emb = emb * drop_mask
         emb_dict[key] = emb
 
@@ -393,6 +400,7 @@ class GeoFMDataset7A(Dataset):
         rebuild_cache=False,
         patch_inputs=("terramind_s1", "terramind_s2"),
         include_folds=None,
+        domain_aug_scale=1.0,
     ):
         # Active THOR patch streams (subset of thor_s1, thor_s2). When empty the
         # dataset behaves byte-identically to the pre-Phase-5D version: same cache
@@ -415,6 +423,7 @@ class GeoFMDataset7A(Dataset):
             self.tiles = [t for t in tiles if folds.get(t["core_id"], cv_fold) == cv_fold]
 
         self.is_train = is_train
+        self.domain_aug_scale = domain_aug_scale  # [Phase 14] embedding domain-aug strength
         self.norm_stats = _load_norm_stats(norm_stats_path)
 
         # Per-instance cache spec: base modalities + any active THOR streams.
@@ -642,7 +651,7 @@ class GeoFMDataset7A(Dataset):
             }
             for n in self._thor_streams:
                 emb_dict[n] = thor[n]
-            emb_dict = augment_domain_shift(emb_dict, self.norm_stats, rng)
+            emb_dict = augment_domain_shift(emb_dict, self.norm_stats, rng, scale=self.domain_aug_scale)
 
             k    = int(rng.integers(0, 4))
             flip = bool(rng.integers(0, 2))
