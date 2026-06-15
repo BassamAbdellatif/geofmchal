@@ -1069,3 +1069,32 @@ ce40 ≈ +0.005–0.01; the untried **ce40+building-overlap** combo for IoU_B; b
 internally) are incremental — realistically worth ~+0.01–0.02 → high-20s rank, **top-3 (needs +0.08) not
 reachable** with these levers in the remaining days. The leaders' gap is most likely structural
 (better embeddings/extraction), not tuning. Best-honest-rank mode from here.
+
+## Phase 14 — Domain augmentation for region transfer: NEGATIVE (2026-06-15)
+
+### 45. Strong embedding domain-aug (scale 3) does NOT improve held-out transfer — hurts height/IoU_B; DA is not the lever.
+Controlled 2×2: `--domain-aug-scale {0,3}` × held-out `--cv-fold {0,2}`, ce40 recipe (N=256 ce0.4, batch24), 40 ep.
+val = held-out region (never augmented). No thermal events (central 10s monitor + per-node guardians).
+
+| run | held fold | aug | proxy | IoU_B | IoU_W | RMSE_B | RMSE_V | min RMSE_V |
+|-----|-----------|-----|-------|-------|-------|--------|--------|------------|
+| `14_da0_f0` | 0 | off | 0.4559 | 0.319 | 0.641 | 1.895 | 3.516 | 3.491 |
+| `14_da3_f0` | 0 | 3×  | 0.4559 | 0.302 | 0.751 | 1.975 | 3.639 | 3.601 |
+| `14_da0_f2` | 2 | off | 0.4724 | 0.296 | 0.667 | 2.036 | 2.917 | 2.911 |
+| `14_da3_f2` | 2 | 3×  | 0.4598 | 0.284 | 0.686 | 2.123 | 3.034 | 3.017 |
+
+- **scale-3 vs no-aug, on BOTH held-out folds: net-negative.** Hurts RMSE_V (+0.12), RMSE_B (+0.08),
+  IoU_B (−0.015); proxy tied (fold0) / −0.013 (fold2). Aggressive channel jitter corrupts the fine-grained
+  height signal. **Only consistent gain = IoU_W** (water +0.11 fold0 / +0.02 fold2) — aug helps the rare
+  class generalize — but the height losses cancel it (fold0 ≈ neutral, fold2 net-negative).
+- **DA via embedding jitter cannot close the transferability gap** → matches the literature (AlphaEarth
+  height paper 2602.17250 flagged the bias/transfer problem but offered NO mitigation; we tried the obvious
+  one, it fails for height/IoU_B). The residual gap is **embedding-information-limited**, not aug-fixable.
+- **Fold-to-fold variance is large** (fold2 RMSE_V 2.9 vs fold0 3.5) — confirms transfer is the real
+  constraint, but it is not aug-solvable. Current production aug (scale 1, in ce40) is ~neutral; do not raise it.
+- **Open micro-lever (low EV):** aug *helped IoU_W* — a water-only / fraction-path-only aug might capture
+  that without the height cost (untested). And scale-0-vs-1 on a fixed fold (does turning aug OFF slightly
+  help height?) is a cheap check, but marginal.
+
+**Phase-14 verdict:** DA is not a step-change. → Pivot to the reliable end-game: **multi-seed / multi-fold
+ensemble of `ce40`** (roadmap P5, ~+0.005–0.01). Best-honest-rank consolidation; top-3 remains out of reach.
