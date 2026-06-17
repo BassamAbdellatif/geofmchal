@@ -291,7 +291,7 @@ def main():
     model_type = params.get("MODEL_TYPE", "decoder_residual").lower()
 
     # 7A dispatch: fully self-contained inference path.
-    if model_type in ("dual_enc_dec_fusion", "fresh_extract"):
+    if model_type in ("dual_enc_dec_fusion", "fresh_extract", "fresh_extract_flex"):
         return predict_7a(args, exp_dir, params)
 
     # CLI args take priority; fall back to training_params.txt; empty string triggers fallback parser below
@@ -596,6 +596,10 @@ def predict_7a(args, exp_dir, params):
     cross_modal = params.get("CROSS_MODAL", "off").strip()
     cross_modal_local = params.get("CROSS_MODAL_LOCAL", "False").strip().lower() == "true"
     height_bins = int(params.get("HEIGHT_BINS", "0").strip())
+    # [Phase 15] fresh_extract_flex: pixel subset + patch-fusion mode (ignored by the
+    # other 7A models). Defaults reproduce a pre-flex run (alpha+tessera, add fusion).
+    pixel_names = [p.strip() for p in params.get("PIXEL_INPUTS", "alpha_earth,tessera").split(",") if p.strip()]
+    patch_fusion = params.get("PATCH_FUSION", "add").strip()
     use_thor = any(p.startswith("thor") for p in patch_names)
 
     model, _ = build_model(model_type, n_channels=64, n_classes=4,
@@ -612,7 +616,9 @@ def predict_7a(args, exp_dir, params):
                            terramind_fusion=terramind_fusion,
                            cross_modal=cross_modal,
                            cross_modal_local=cross_modal_local,
-                           height_bins=height_bins)
+                           height_bins=height_bins,
+                           pixel_inputs=pixel_names,
+                           patch_fusion=patch_fusion)
     model = model.to(device)
     state = torch.load(model_path, map_location=device)
     state = _remap_legacy_7a_state_dict(state, model)
