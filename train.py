@@ -123,12 +123,16 @@ def save_experiment_config(pixel_inputs=None, patch_inputs=None):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train emb2heights baseline models")
-    parser.add_argument("--model-type", type=str, default=MODEL_TYPE, choices=["auto", "lightunet", "decoder_residual", "attention_fusion", "dual_enc_dec_fusion", "fresh_extract"])
+    parser.add_argument("--model-type", type=str, default=MODEL_TYPE, choices=["auto", "lightunet", "decoder_residual", "attention_fusion", "dual_enc_dec_fusion", "fresh_extract", "fresh_extract_flex"])
     parser.add_argument("--output-dir", type=str, default=BASE_DIR)
     parser.add_argument("--train-embeddings-dir", type=str, default=None, help="Path to training embeddings. Defaults to path in config.py based on model-type.")
     parser.add_argument("--train-targets-dir", type=str, default=None, help="Path to training targets. Defaults to path in config.py.")
     parser.add_argument("--pixel-inputs", type=str, default="tessera", help="Comma-separated pixel embeddings to concatenate (e.g. tessera,alpha_earth, or 'all').")
     parser.add_argument("--patch-inputs", type=str, default="terramind_s1", help="Comma-separated patch embeddings to concatenate (e.g. terramind_s1,thor_s2, or 'all').")
+    parser.add_argument("--patch-fusion", type=str, default="add", choices=["add", "pyramid"],
+                        help="[Phase 15] fresh_extract_flex: how patch tokens enter the pyramid. "
+                             "'add' = legacy 2-coarse-level injection; 'pyramid' = learned "
+                             "multi-scale token decoder fused at all 5 scales (gated, identity at init).")
     parser.add_argument("--experiment-name", type=str, default=EXPERIMENT_NAME)
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     parser.add_argument("--patch-size", type=int, default=PATCH_SIZE)
@@ -342,7 +346,7 @@ def main():
 
     # 7A dispatch: fully self-contained path; never touches the legacy branches.
     # fresh_extract (Phase 11) shares the same data/loss/eval pipeline.
-    if MODEL_TYPE in ("dual_enc_dec_fusion", "fresh_extract"):
+    if MODEL_TYPE in ("dual_enc_dec_fusion", "fresh_extract", "fresh_extract_flex"):
         return train_7a(args)
 
     # Resolve directories using config.py
@@ -694,12 +698,31 @@ def train_7a(args):
     for p in patch_names:
         if p not in PATCH_DIR_MAP:
             raise ValueError(f"Unknown patch input '{p}'. Valid: {list(PATCH_DIR_MAP)}")
-    if not any(p.endswith("_s1") for p in patch_names) and \
+    # Empty patch set is allowed (Phase 15 pixel-only ablation: fresh_extract_flex runs
+    # on pixel encoders alone). If patches ARE named, require a real sensor stream.
+    if patch_names and not any(p.endswith("_s1") for p in patch_names) and \
        not any(p.endswith("_s2") for p in patch_names):
         raise ValueError(f"--patch-inputs must include at least one *_s1 or *_s2 stream; got {patch_names}")
     use_thor = any(p.startswith("thor") for p in patch_names)
     print(f"   >> patch inputs: {patch_names}  (use_thor={use_thor}, "
           f"stem={args.patch_stem_version}, xattn_heads={args.xattn_heads})")
+
+    # [Phase 15] Pixel-input subset for fresh_extract_flex (other models ignore it and
+    # always consume the full alpha+tessera batch the dataset provides). "alpha" -> the
+    # dataset key "alpha_earth"; "all" -> both pixel encoders.
+    _PIXEL_VALID = ("alpha_earth", "tessera")
+    _pix_str = args.pixel_inputs.strip().lower()
+    if _pix_str == "all":
+        pixel_names = list(_PIXEL_VALID)
+    else:
+        pixel_names = [("alpha_earth" if p.strip() == "alpha" else p.strip())
+                       for p in _pix_str.split(",") if p.strip()]
+    for p in pixel_names:
+        if p not in _PIXEL_VALID:
+            raise ValueError(f"Unknown pixel input '{p}'. Valid: {list(_PIXEL_VALID)} (or 'alpha', 'all').")
+    if not pixel_names:
+        raise ValueError("--pixel-inputs must name at least one of alpha_earth, tessera.")
+    print(f"   >> pixel inputs: {pixel_names}  (patch_fusion={args.patch_fusion})")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # bf16 autocast context (Phase 8 --amp): halves activation memory so bs32 fits
@@ -745,6 +768,8 @@ def train_7a(args):
         f.write(f"USE_GRADNORM: {args.use_gradnorm}\n")
         f.write(f"USE_THOR: {use_thor}\n")
         f.write(f"PATCH_INPUTS: {','.join(patch_names)}\n")
+        f.write(f"PIXEL_INPUTS: {','.join(pixel_names)}\n")
+        f.write(f"PATCH_FUSION: {args.patch_fusion}\n")
         f.write(f"PATCH_STEM_VERSION: {args.patch_stem_version}\n")
         f.write(f"XATTN_HEADS: {args.xattn_heads}\n")
         f.write(f"PATCH_ROUTING: {args.patch_routing}\n")
@@ -837,7 +862,9 @@ def train_7a(args):
                            terramind_fusion=args.terramind_fusion,
                            cross_modal=args.cross_modal,
                            cross_modal_local=args.cross_modal_local,
-                           height_bins=args.height_bins)
+                           height_bins=args.height_bins,
+                           pixel_inputs=pixel_names,
+                           patch_fusion=args.patch_fusion)
     model = model.to(device)
     print(f"   >> params: {sum(p.numel() for p in model.parameters())/1e6:.2f}M"
           f"  (height_bridge={'off' if args.no_height_bridge else 'on'})")

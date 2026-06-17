@@ -345,7 +345,8 @@ def build_model(model_type, n_channels, n_classes, use_height_bridge=True,
                 use_fraction_bridge=False, fraction_bridge_alpha=0.2,
                 fraction_head="sigmoid3", bridge_alpha=0.2, use_terramind=True,
                 terramind_fusion="add", cross_modal="off", cross_modal_local=False,
-                height_bins=0):
+                height_bins=0,
+                pixel_inputs=("alpha_earth", "tessera"), patch_fusion="add"):
     selected = model_type.lower()
 
     if selected == "auto":
@@ -379,10 +380,19 @@ def build_model(model_type, n_channels, n_classes, use_height_bridge=True,
             cross_modal_local=cross_modal_local,
             height_bins=height_bins,
         ), selected
+    if selected == "fresh_extract_flex":
+        return FreshExtractFlex(
+            pixel_inputs=pixel_inputs,
+            patch_inputs=patch_inputs,
+            fraction_head=fraction_head,
+            patch_stem_version=patch_stem_version,
+            patch_fusion=patch_fusion,
+            height_bins=height_bins,
+        ), selected
 
     raise ValueError(
         f"Unknown model_type '{model_type}'. Use one of: auto, lightunet, "
-        f"decoder_residual, dual_enc_dec_fusion"
+        f"decoder_residual, dual_enc_dec_fusion, fresh_extract, fresh_extract_flex"
     )
 
 
@@ -1128,6 +1138,183 @@ class FreshExtract(nn.Module):
                     pyr_frac = pyr
         ffeat = self.fraction_decoder(pyr_frac)
         hfeat = self.height_decoder(pyr)
+        return {"fraction": self.frac_head(ffeat),
+                "height": self.height_head(hfeat),
+                "binary": self.binary_head(ffeat)}
+
+    def expected_height(self, logits):
+        """Bin logits (B,N,H,W) -> (B,1,H,W) normalised soft-expectation height."""
+        p = torch.softmax(logits, dim=1)
+        return (p * self.height_centers.view(1, -1, 1, 1)).sum(1, keepdim=True)
+
+    @torch.no_grad()
+    def predict(self, batch):
+        out = self.forward(batch)
+        if self.fraction_head == "softmax4":
+            frac = torch.softmax(out["fraction"], dim=1)[:, :3]
+        else:
+            frac = torch.sigmoid(out["fraction"])
+        h = self.expected_height(out["height"]) if self.height_bins > 0 else out["height"]
+        return torch.cat([frac, h], dim=1)
+
+
+# ===================================================================================
+# Phase 15 — FreshExtractFlex (spec: prompts/exp-15-token-decoder.md)
+#   Pixel- and patch-parametrized FreshExtract with an optional LEARNED multi-scale
+#   token decoder. FreshExtract is left frozen for ce40 reproducibility (CLAUDE.md
+#   additive rule); this is the ablation vehicle for the 6-embedding sweep.
+# ===================================================================================
+_PIXEL_IN_CH = {"alpha_earth": 64, "tessera": 128}
+
+
+class _TokenPyramid(nn.Module):
+    """Learned multi-scale token decoder (DPT-style channel->space reassembly).
+
+    A coarse token map (c4 @ 16x16) is upsampled to feature maps at every pyramid
+    level [c0@256, c1@128, c2@64, c3@32, c4@16] via *learned* transpose-conv blocks
+    (NOT bilinear interpolation -- interpolation adds no information; this inverts the
+    channel-packing the FSQ-VAE / ViT tokenizer produced). Each level is fused into the
+    routed decoder pyramid as a GATED zero-init residual, so at init the block is exactly
+    identity (no destabilization; can only add signal if it earns it).
+    """
+
+    def __init__(self, c):
+        super().__init__()
+        self.refine4 = _DoubleConvGN(c[4], c[4])         # refine token map at L4 (16)
+        self.up3 = self._up(c[4], c[3])                  # 16 -> 32
+        self.up2 = self._up(c[3], c[2])                  # 32 -> 64
+        self.up1 = self._up(c[2], c[1])                  # 64 -> 128
+        self.up0 = self._up(c[1], c[0])                  # 128 -> 256
+        self.gate = nn.Parameter(torch.zeros(5))         # per-level fusion gate (identity at init)
+
+    @staticmethod
+    def _up(in_ch, out_ch):
+        return nn.Sequential(
+            nn.ConvTranspose2d(in_ch, out_ch, kernel_size=2, stride=2, bias=False),
+            _gn(out_ch), nn.GELU(),
+            _DoubleConvGN(out_ch, out_ch),
+        )
+
+    def forward(self, tok, pyr):
+        # tok: (B,c4,16,16) ; pyr: list[5] [c0@256, c1@128, c2@64, c3@32, c4@16]
+        f4 = self.refine4(tok)
+        f3 = self.up3(f4)
+        f2 = self.up2(f3)
+        f1 = self.up1(f2)
+        f0 = self.up0(f1)
+        feats = [f0, f1, f2, f3, f4]
+        return [pyr[l] + self.gate[l] * feats[l] for l in range(5)]
+
+
+class FreshExtractFlex(nn.Module):
+    """Phase 15 ablation vehicle. Same pyramid backbone as FreshExtract, but:
+      - PIXEL side parametrized by `pixel_inputs` (subset of {alpha_earth, tessera});
+        one stem+encoder per active modality (own pathway -- never concat at input,
+        the 6A IoU_B-destroying lesson). Per-level fuse = Conv2d(K*c, c), K=#pixel inputs.
+      - PATCH side parametrized by `patch_inputs`, routed by sensor suffix
+        (*_s1 -> height decoder, *_s2 -> fraction decoder); same-sensor streams averaged.
+      - `patch_fusion`: 'add' (legacy 2-coarse-level injection, the baseline) or
+        'pyramid' (learned multi-scale token decoder fusing at all 5 scales).
+      - binned height head carried over (height_bins>0 -> distribution + soft-expectation).
+
+    forward(batch{alpha_earth?, tessera?, <patch streams>}) ->
+        {fraction (B,3|4,256,256), height (B,1|N,256,256), binary (B,1,256,256)}
+    """
+    CHANNELS = [96, 160, 256, 384, 512]   # @ [256,128,64,32,16] (== FreshExtract)
+
+    def __init__(self, pixel_inputs=("alpha_earth", "tessera"),
+                 patch_inputs=("terramind_s1",), fraction_head="softmax4",
+                 patch_stem_version="v2", patch_fusion="add", height_bins=0):
+        super().__init__()
+        c = self.CHANNELS
+        self.fraction_head = fraction_head
+        self.patch_fusion = patch_fusion
+        self.pixel_inputs = list(pixel_inputs)
+        if not self.pixel_inputs:
+            raise ValueError("FreshExtractFlex requires >=1 pixel input")
+        for n in self.pixel_inputs:
+            if n not in _PIXEL_IN_CH:
+                raise ValueError(f"unknown pixel input {n!r}; choices {list(_PIXEL_IN_CH)}")
+        # per-modality pixel stems + deep encoders (each its own pathway)
+        self.pixel_stems = nn.ModuleDict(
+            {n: _ModalityStem(_PIXEL_IN_CH[n], c[0]) for n in self.pixel_inputs})
+        self.pixel_encs = nn.ModuleDict({n: _DeepEncoder(c) for n in self.pixel_inputs})
+        K = len(self.pixel_inputs)
+        self.fuse = nn.ModuleList([nn.Conv2d(K * c[l], c[l], 1, bias=False) for l in range(5)])
+
+        # patch streams, routed by sensor suffix
+        self.patch_inputs = list(patch_inputs)
+        self._s1_names = [n for n in self.patch_inputs if n.endswith("_s1")]
+        self._s2_names = [n for n in self.patch_inputs if n.endswith("_s2")]
+        if self.patch_inputs:
+            self.tok_stems = nn.ModuleDict(
+                {n: _make_patch_stem(patch_stem_version, 768, c[4]) for n in self.patch_inputs})
+            if patch_fusion == "add":
+                if self._s1_names:
+                    self.s1_to_l3 = nn.Conv2d(c[4], c[3], 1, bias=False)
+                if self._s2_names:
+                    self.s2_to_l3 = nn.Conv2d(c[4], c[3], 1, bias=False)
+            elif patch_fusion == "pyramid":
+                if self._s1_names:
+                    self.s1_pyr = _TokenPyramid(c)
+                if self._s2_names:
+                    self.s2_pyr = _TokenPyramid(c)
+            else:
+                raise ValueError(f"patch_fusion {patch_fusion!r} must be 'add' or 'pyramid'")
+
+        self.fraction_decoder = _PyrDecoder(c)
+        self.height_decoder = _PyrDecoder(c)
+        nfrac = 4 if fraction_head == "softmax4" else 3
+        self.frac_head = nn.Conv2d(c[0], nfrac, 1)
+        self.binary_head = nn.Conv2d(c[0], 1, 1)
+        self.height_bins = height_bins
+        self.height_head = nn.Conv2d(c[0], height_bins if height_bins > 0 else 1, 1)
+        if height_bins > 0:
+            centers = (torch.arange(height_bins).float() + 0.5) / height_bins * 1.5
+            self.register_buffer("height_centers", centers)
+
+    def _token_grid(self, batch, names):
+        """Mean over the named patch streams -> (B,c4,16,16), or None if none present."""
+        grids = []
+        for n in names:
+            if n in batch:
+                t = self.tok_stems[n](batch[n])                  # (B,256,c4)
+                B = t.shape[0]
+                grids.append(t.transpose(1, 2).reshape(B, -1, 16, 16))
+        if not grids:
+            return None
+        return sum(grids) / len(grids)
+
+    @staticmethod
+    def _inject_add(pyr, tok, to_l3):
+        pyr = list(pyr)
+        pyr[4] = pyr[4] + tok
+        up = F.interpolate(tok, size=pyr[3].shape[-2:], mode="bilinear", align_corners=False)
+        pyr[3] = pyr[3] + to_l3(up)
+        return pyr
+
+    def forward(self, batch):
+        # pixel encoders -> per-modality pyramids -> concat + 1x1 fuse -> shared base pyramid
+        pyrs = [self.pixel_encs[n](self.pixel_stems[n](batch[n])) for n in self.pixel_inputs]
+        pyr = [self.fuse[l](torch.cat([p[l] for p in pyrs], dim=1)) for l in range(5)]
+
+        pyr_h = pyr_f = pyr
+        if self.patch_inputs:
+            tok1 = self._token_grid(batch, self._s1_names) if self._s1_names else None
+            tok2 = self._token_grid(batch, self._s2_names) if self._s2_names else None
+            if self.patch_fusion == "add":
+                if tok1 is not None:
+                    pyr_h = self._inject_add(pyr, tok1, self.s1_to_l3)
+                if tok2 is not None:
+                    pyr_f = self._inject_add(pyr, tok2, self.s2_to_l3)
+            else:  # pyramid
+                if tok1 is not None:
+                    pyr_h = self.s1_pyr(tok1, pyr)
+                if tok2 is not None:
+                    pyr_f = self.s2_pyr(tok2, pyr)
+
+        hfeat = self.height_decoder(pyr_h)
+        ffeat = self.fraction_decoder(pyr_f)
         return {"fraction": self.frac_head(ffeat),
                 "height": self.height_head(hfeat),
                 "binary": self.binary_head(ffeat)}
