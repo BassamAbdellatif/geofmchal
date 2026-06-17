@@ -724,6 +724,28 @@ def train_7a(args):
         raise ValueError("--pixel-inputs must name at least one of alpha_earth, tessera.")
     print(f"   >> pixel inputs: {pixel_names}  (patch_fusion={args.patch_fusion})")
 
+    # [Phase 15] Control-flag compatibility guard. Fail loudly instead of crashing
+    # cryptically (GradNorm) or SILENTLY IGNORING a copied/stray flag — the dual-pixel
+    # models have no single shared 'alpha_encoder' (GradNorm reference), and
+    # fresh_extract_flex controls patches purely via --patch-inputs (no use_terramind gate,
+    # no terramind_fusion/cross_modal knobs).
+    if args.model_type in ("fresh_extract", "fresh_extract_flex") and args.use_gradnorm:
+        raise SystemExit(
+            f"ERROR: --use-gradnorm is unsupported for {args.model_type} (no single shared "
+            "encoder layer for the GradNorm reference). Pass --no-use-gradnorm.")
+    if args.model_type == "fresh_extract_flex":
+        if not args.use_terramind:
+            raise SystemExit(
+                "ERROR: fresh_extract_flex controls patch streams ONLY via --patch-inputs "
+                "(empty string = pixel-only). --no-use-terramind is a FreshExtract-only gate "
+                "and would be SILENTLY IGNORED here. Drop it; for a pixel-only run pass "
+                "--patch-inputs '' instead.")
+        if args.terramind_fusion != "add" or args.cross_modal != "off":
+            raise SystemExit(
+                "ERROR: fresh_extract_flex uses --patch-fusion {add,pyramid}; "
+                "--terramind-fusion / --cross-modal are FreshExtract-only and would be "
+                "silently ignored. Remove them.")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # bf16 autocast context (Phase 8 --amp): halves activation memory so bs32 fits
     # with headroom. No GradScaler needed for bf16. nullcontext when off (fp32).
