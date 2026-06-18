@@ -123,16 +123,31 @@ def save_experiment_config(pixel_inputs=None, patch_inputs=None):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train emb2heights baseline models")
-    parser.add_argument("--model-type", type=str, default=MODEL_TYPE, choices=["auto", "lightunet", "decoder_residual", "attention_fusion", "dual_enc_dec_fusion", "fresh_extract", "fresh_extract_flex"])
+    parser.add_argument("--model-type", type=str, default=MODEL_TYPE, choices=["auto", "lightunet", "decoder_residual", "attention_fusion", "dual_enc_dec_fusion", "fresh_extract", "fresh_extract_flex", "flexnet"])
     parser.add_argument("--output-dir", type=str, default=BASE_DIR)
     parser.add_argument("--train-embeddings-dir", type=str, default=None, help="Path to training embeddings. Defaults to path in config.py based on model-type.")
     parser.add_argument("--train-targets-dir", type=str, default=None, help="Path to training targets. Defaults to path in config.py.")
     parser.add_argument("--pixel-inputs", type=str, default="tessera", help="Comma-separated pixel embeddings to concatenate (e.g. tessera,alpha_earth, or 'all').")
     parser.add_argument("--patch-inputs", type=str, default="terramind_s1", help="Comma-separated patch embeddings to concatenate (e.g. terramind_s1,thor_s2, or 'all').")
-    parser.add_argument("--patch-fusion", type=str, default="add", choices=["add", "pyramid"],
-                        help="[Phase 15] fresh_extract_flex: how patch tokens enter the pyramid. "
-                             "'add' = legacy 2-coarse-level injection; 'pyramid' = learned "
-                             "multi-scale token decoder fused at all 5 scales (gated, identity at init).")
+    parser.add_argument("--patch-fusion", type=str, default="add", choices=["none", "add", "pyramid"],
+                        help="[Phase 15/16] how patch tokens enter the pyramid. 'none' = pixel-only "
+                             "(flexnet default behavior); 'add' = legacy 2-coarse-level injection; "
+                             "'pyramid' = learned multi-scale token decoder (gated, identity at init).")
+    # --- [Phase 16] flexnet: configurable encoder/decoder (ablatable) ---
+    parser.add_argument("--enc-widths", type=str, default="96,160,256,384,512",
+                        help="[flexnet] channels per stage; #entries sets depth-of-downsampling "
+                             "(bottleneck res = 256/2^(N-1): 5→16, 4→32, 3→64).")
+    parser.add_argument("--enc-blocks", type=str, default="1",
+                        help="[flexnet] refine blocks per stage ('deeper branches'); single int or comma list len=#stages.")
+    parser.add_argument("--enc-block", type=str, default="double", choices=["double", "residual", "dense"],
+                        help="[flexnet] block type ('dense' aliased to residual in v1).")
+    parser.add_argument("--enc-dilations", type=str, default="1",
+                        help="[flexnet] dilation per stage (grow RF without downsampling); single int or comma list.")
+    parser.add_argument("--decoder", type=str, default="unet", choices=["unet", "unetpp"],
+                        help="[flexnet] decoder topology; unetpp = nested dense skips (more transferable).")
+    parser.add_argument("--dec-blocks", type=int, default=1, help="[flexnet] refine blocks per decoder up-stage.")
+    parser.add_argument("--height-mode", type=str, default="shared", choices=["shared", "class_cond"],
+                        help="[flexnet] 'class_cond' conditions the height head on the fraction prediction.")
     parser.add_argument("--experiment-name", type=str, default=EXPERIMENT_NAME)
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     parser.add_argument("--patch-size", type=int, default=PATCH_SIZE)
@@ -346,7 +361,7 @@ def main():
 
     # 7A dispatch: fully self-contained path; never touches the legacy branches.
     # fresh_extract (Phase 11) shares the same data/loss/eval pipeline.
-    if MODEL_TYPE in ("dual_enc_dec_fusion", "fresh_extract", "fresh_extract_flex"):
+    if MODEL_TYPE in ("dual_enc_dec_fusion", "fresh_extract", "fresh_extract_flex", "flexnet"):
         return train_7a(args)
 
     # Resolve directories using config.py
@@ -729,7 +744,7 @@ def train_7a(args):
     # models have no single shared 'alpha_encoder' (GradNorm reference), and
     # fresh_extract_flex controls patches purely via --patch-inputs (no use_terramind gate,
     # no terramind_fusion/cross_modal knobs).
-    if args.model_type in ("fresh_extract", "fresh_extract_flex") and args.use_gradnorm:
+    if args.model_type in ("fresh_extract", "fresh_extract_flex", "flexnet") and args.use_gradnorm:
         raise SystemExit(
             f"ERROR: --use-gradnorm is unsupported for {args.model_type} (no single shared "
             "encoder layer for the GradNorm reference). Pass --no-use-gradnorm.")
@@ -792,6 +807,13 @@ def train_7a(args):
         f.write(f"PATCH_INPUTS: {','.join(patch_names)}\n")
         f.write(f"PIXEL_INPUTS: {','.join(pixel_names)}\n")
         f.write(f"PATCH_FUSION: {args.patch_fusion}\n")
+        f.write(f"ENC_WIDTHS: {args.enc_widths}\n")
+        f.write(f"ENC_BLOCKS: {args.enc_blocks}\n")
+        f.write(f"ENC_BLOCK: {args.enc_block}\n")
+        f.write(f"ENC_DILATIONS: {args.enc_dilations}\n")
+        f.write(f"DECODER: {args.decoder}\n")
+        f.write(f"DEC_BLOCKS: {args.dec_blocks}\n")
+        f.write(f"HEIGHT_MODE: {args.height_mode}\n")
         f.write(f"PATCH_STEM_VERSION: {args.patch_stem_version}\n")
         f.write(f"XATTN_HEADS: {args.xattn_heads}\n")
         f.write(f"PATCH_ROUTING: {args.patch_routing}\n")
@@ -870,6 +892,10 @@ def train_7a(args):
     )
 
     print("--- 7A Model Init ---")
+    # [Phase 16] flexnet encoder/decoder config (single int or comma-list)
+    _ew = tuple(int(x) for x in args.enc_widths.split(",") if x.strip())
+    _eb = [int(x) for x in args.enc_blocks.split(",")] if "," in args.enc_blocks else int(args.enc_blocks)
+    _ed = [int(x) for x in args.enc_dilations.split(",")] if "," in args.enc_dilations else int(args.enc_dilations)
     model, _ = build_model(args.model_type, n_channels=64, n_classes=4,
                            use_height_bridge=not args.no_height_bridge,
                            patch_inputs=patch_names,
@@ -886,7 +912,10 @@ def train_7a(args):
                            cross_modal_local=args.cross_modal_local,
                            height_bins=args.height_bins,
                            pixel_inputs=pixel_names,
-                           patch_fusion=args.patch_fusion)
+                           patch_fusion=args.patch_fusion,
+                           enc_widths=_ew, enc_blocks=_eb, enc_block=args.enc_block,
+                           enc_dilations=_ed, decoder=args.decoder, dec_blocks=args.dec_blocks,
+                           height_mode=args.height_mode)
     model = model.to(device)
     print(f"   >> params: {sum(p.numel() for p in model.parameters())/1e6:.2f}M"
           f"  (height_bridge={'off' if args.no_height_bridge else 'on'})")

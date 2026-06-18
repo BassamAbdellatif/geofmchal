@@ -291,7 +291,7 @@ def main():
     model_type = params.get("MODEL_TYPE", "decoder_residual").lower()
 
     # 7A dispatch: fully self-contained inference path.
-    if model_type in ("dual_enc_dec_fusion", "fresh_extract", "fresh_extract_flex"):
+    if model_type in ("dual_enc_dec_fusion", "fresh_extract", "fresh_extract_flex", "flexnet"):
         return predict_7a(args, exp_dir, params)
 
     # CLI args take priority; fall back to training_params.txt; empty string triggers fallback parser below
@@ -601,6 +601,12 @@ def predict_7a(args, exp_dir, params):
     pixel_names = [p.strip() for p in params.get("PIXEL_INPUTS", "alpha_earth,tessera").split(",") if p.strip()]
     patch_fusion = params.get("PATCH_FUSION", "add").strip()
     use_thor = any(p.startswith("thor") for p in patch_names)
+    # [Phase 16] flexnet encoder/decoder config (ignored by other models)
+    _ew = tuple(int(x) for x in params.get("ENC_WIDTHS", "96,160,256,384,512").split(",") if x.strip())
+    _ebs = params.get("ENC_BLOCKS", "1").strip()
+    _eb = [int(x) for x in _ebs.split(",")] if "," in _ebs else int(_ebs)
+    _eds = params.get("ENC_DILATIONS", "1").strip()
+    _ed = [int(x) for x in _eds.split(",")] if "," in _eds else int(_eds)
 
     model, _ = build_model(model_type, n_channels=64, n_classes=4,
                            use_height_bridge=use_height_bridge,
@@ -618,7 +624,11 @@ def predict_7a(args, exp_dir, params):
                            cross_modal_local=cross_modal_local,
                            height_bins=height_bins,
                            pixel_inputs=pixel_names,
-                           patch_fusion=patch_fusion)
+                           patch_fusion=patch_fusion,
+                           enc_widths=_ew, enc_blocks=_eb, enc_block=params.get("ENC_BLOCK", "double").strip(),
+                           enc_dilations=_ed, decoder=params.get("DECODER", "unet").strip(),
+                           dec_blocks=int(params.get("DEC_BLOCKS", "1")),
+                           height_mode=params.get("HEIGHT_MODE", "shared").strip())
     model = model.to(device)
     state = torch.load(model_path, map_location=device)
     state = _remap_legacy_7a_state_dict(state, model)

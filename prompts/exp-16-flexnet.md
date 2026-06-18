@@ -37,11 +37,10 @@ baseline. Reuse `_ModalityStem`, `_make_patch_stem`, `_TokenPyramid`; new code =
 ### Encoder (the core knobs)
 | flag | meaning | default |
 |------|---------|---------|
-| `--enc-widths "96,160,256,384,512"` | channels per stage (len = #stages) | 5 stages |
-| `--enc-blocks "1,1,1,1,1"` (or int) | **conv blocks per stage = "deeper branches"** | 1 |
-| `--enc-block {double,residual,dense}` | block type (deeper feature learning / grad flow) | double |
-| `--bottleneck-res {16,32,64}` | **how far to downsample** (gentler = 32/64) | 16 |
-| `--enc-dilations "1,1,1,1,1"` | dilated convs at deep stages: grow RF, keep resolution | off |
+| `--enc-widths "96,160,256,384,512"` | channels per level; **#entries sets bottleneck res** (5→16, 4→32, 3→64 = "how far to downsample") | 5 levels |
+| `--enc-blocks "1,2,2,3"` (or int) | **refine blocks per stage = "deeper branches"**; int, or comma-list of length **len(enc-widths)−1** (=#downsampling stages) | 1 |
+| `--enc-block {double,residual,dense}` | block type ('dense' aliased to residual in v1) | double |
+| `--enc-dilations "1,1,2,4"` (or int) | dilated convs (grow RF, keep resolution); int or comma-list length len(enc-widths)−1 | 1 |
 
 ### Fusion
 - Symmetric per-level 1×1 fuse of the K pixel pyramids. `--patch-fusion {none,add,pyramid}` (default none).
@@ -59,10 +58,10 @@ baseline. Reuse `_ModalityStem`, `_make_patch_stem`, `_TokenPyramid`; new code =
 ## 3. Ablation plan — ONE axis at a time, MULTI-FOLD (capacity overfits → must transfer)
 Held-out folds {0,2}, anchored to the FlexNet default baseline; judge by **mean held-out + train→held-out gap**:
 1. **Depth** — `--enc-blocks` 1 vs 2 vs 3 (the instinct).
-2. **Bottleneck res** — 16 vs 32 (gentler downsampling).
+2. **Bottleneck res** — 5-width (→16) vs 4-width (→32) via `--enc-widths` (gentler downsampling).
 3. **Block type** — double vs residual.
 4. **Decoder** — unet vs unetpp.
-5. **Dilation** — off vs `"1,1,1,2,4"`.
+5. **Dilation** — off (`1`) vs `"1,1,2,4"`.
 6. **Height** — shared vs class_cond.
 Then **combine the top 2–3 transferring axes**, re-confirm multi-fold, and spend ONE platform slot on the winner.
 

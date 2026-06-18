@@ -346,7 +346,9 @@ def build_model(model_type, n_channels, n_classes, use_height_bridge=True,
                 fraction_head="sigmoid3", bridge_alpha=0.2, use_terramind=True,
                 terramind_fusion="add", cross_modal="off", cross_modal_local=False,
                 height_bins=0,
-                pixel_inputs=("alpha_earth", "tessera"), patch_fusion="add"):
+                pixel_inputs=("alpha_earth", "tessera"), patch_fusion="add",
+                enc_widths=(96, 160, 256, 384, 512), enc_blocks=1, enc_block="double",
+                enc_dilations=1, decoder="unet", dec_blocks=1, height_mode="shared"):
     selected = model_type.lower()
 
     if selected == "auto":
@@ -389,10 +391,19 @@ def build_model(model_type, n_channels, n_classes, use_height_bridge=True,
             patch_fusion=patch_fusion,
             height_bins=height_bins,
         ), selected
+    if selected == "flexnet":
+        return FlexNet(
+            pixel_inputs=pixel_inputs,
+            patch_inputs=patch_inputs if patch_fusion != "none" else (),
+            enc_widths=enc_widths, enc_blocks=enc_blocks, enc_block=enc_block,
+            enc_dilations=enc_dilations, decoder=decoder, dec_blocks=dec_blocks,
+            patch_stem_version=patch_stem_version, patch_fusion=patch_fusion,
+            fraction_head=fraction_head, height_bins=height_bins, height_mode=height_mode,
+        ), selected
 
     raise ValueError(
         f"Unknown model_type '{model_type}'. Use one of: auto, lightunet, "
-        f"decoder_residual, dual_enc_dec_fusion, fresh_extract, fresh_extract_flex"
+        f"decoder_residual, dual_enc_dec_fusion, fresh_extract, fresh_extract_flex, flexnet"
     )
 
 
@@ -1331,5 +1342,249 @@ class FreshExtractFlex(nn.Module):
             frac = torch.softmax(out["fraction"], dim=1)[:, :3]
         else:
             frac = torch.sigmoid(out["fraction"])
+        h = self.expected_height(out["height"]) if self.height_bins > 0 else out["height"]
+        return torch.cat([frac, h], dim=1)
+
+# ===================================================================================
+# Phase 16 — FlexNet (spec: prompts/exp-16-flexnet.md)
+#   Configurable-depth, multi-modal, ablatable encoder/decoder. Default config reproduces
+#   the fresh_extract_flex skeleton; every axis (blocks/stage, #levels=bottleneck-res,
+#   block-type, dilation, decoder topology, height-mode) is a flag. Additive — FreshExtract
+#   and FreshExtractFlex are left frozen.
+# ===================================================================================
+class _ConvUnit(nn.Module):
+    """conv3x3(stride,dilation) -> GroupNorm -> GELU."""
+    def __init__(self, in_ch, out_ch, stride=1, dilation=1):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, stride=stride, padding=dilation, dilation=dilation, bias=False),
+            _gn(out_ch), nn.GELU())
+    def forward(self, x):
+        return self.block(x)
+
+
+class _RefineBlk(nn.Module):
+    """Two ConvUnits at fixed width; optional residual add (block_type='residual')."""
+    def __init__(self, ch, residual, dilation=1):
+        super().__init__()
+        self.u1 = _ConvUnit(ch, ch, dilation=dilation)
+        self.u2 = _ConvUnit(ch, ch, dilation=dilation)
+        self.residual = residual
+    def forward(self, x):
+        y = self.u2(self.u1(x))
+        return x + y if self.residual else y
+
+
+class _EncStageF(nn.Module):
+    """Stride-2 downsample (in->out) then `blocks` refine blocks at `out` (dilated)."""
+    def __init__(self, in_ch, out_ch, blocks, residual, dilation):
+        super().__init__()
+        self.down = _ConvUnit(in_ch, out_ch, stride=2)
+        self.refine = nn.Sequential(*[_RefineBlk(out_ch, residual, dilation) for _ in range(max(1, blocks))])
+    def forward(self, x):
+        return self.refine(self.down(x))
+
+
+class _FlexEncoder(nn.Module):
+    """stem_out (widths[0] @256) -> pyramid [widths[0]@256, widths[1]@128, ... widths[L]@(256/2^L)]."""
+    def __init__(self, widths, blocks, residual, dilations):
+        super().__init__()
+        L = len(widths) - 1
+        self.stages = nn.ModuleList([
+            _EncStageF(widths[i], widths[i + 1], blocks[i], residual, dilations[i]) for i in range(L)])
+    def forward(self, x0):
+        feats = [x0]
+        x = x0
+        for st in self.stages:
+            x = st(x); feats.append(x)
+        return feats
+
+
+class _UpF(nn.Module):
+    """Upsample (x2) -> 1x1 reduce -> concat skip -> ConvUnit fuse -> (blocks-1) refines."""
+    def __init__(self, in_ch, skip_ch, out_ch, blocks, residual):
+        super().__init__()
+        self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
+        self.reduce = nn.Conv2d(in_ch, out_ch, 1, bias=False)
+        self.fuse = _ConvUnit(out_ch + skip_ch, out_ch)
+        self.refine = nn.Sequential(*[_RefineBlk(out_ch, residual) for _ in range(max(0, blocks - 1))])
+    def forward(self, x, skip):
+        x = self.reduce(self.up(x))
+        if x.shape[-2:] != skip.shape[-2:]:
+            x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
+        return self.refine(self.fuse(torch.cat([x, skip], dim=1)))
+
+
+class _UNetDec(nn.Module):
+    """Plain U-Net decoder over a configurable pyramid -> widths[0] @256."""
+    def __init__(self, widths, blocks, residual):
+        super().__init__()
+        L = len(widths) - 1
+        self.ups = nn.ModuleList([_UpF(widths[i], widths[i - 1], widths[i - 1], blocks, residual)
+                                  for i in range(L, 0, -1)])
+    def forward(self, pyr):
+        x = pyr[-1]
+        for k, up in enumerate(self.ups):
+            x = up(x, pyr[-2 - k])
+        return x
+
+
+class _UNetPPDec(nn.Module):
+    """U-Net++ nested dense skips -> widths[0] @256. Node X[i,j] = conv(concat(X[i,0..j-1], up(X[i+1,j-1])))."""
+    def __init__(self, widths, residual):
+        super().__init__()
+        self.L = len(widths) - 1
+        self.up = nn.ModuleDict()
+        self.node = nn.ModuleDict()
+        for j in range(1, self.L + 1):
+            for i in range(0, self.L + 1 - j):
+                self.up[f"{i}_{j}"] = nn.Sequential(
+                    nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+                    nn.Conv2d(widths[i + 1], widths[i], 1, bias=False))
+                in_ch = widths[i] * (j + 1)        # j same-level nodes + 1 upsampled (reduced to widths[i])
+                self.node[f"{i}_{j}"] = nn.Sequential(_ConvUnit(in_ch, widths[i]), _RefineBlk(widths[i], residual))
+    def forward(self, pyr):
+        X = {(i, 0): pyr[i] for i in range(self.L + 1)}
+        for j in range(1, self.L + 1):
+            for i in range(0, self.L + 1 - j):
+                up = self.up[f"{i}_{j}"](X[(i + 1, j - 1)])
+                if up.shape[-2:] != X[(i, 0)].shape[-2:]:
+                    up = F.interpolate(up, size=X[(i, 0)].shape[-2:], mode="bilinear", align_corners=False)
+                X[(i, j)] = self.node[f"{i}_{j}"](torch.cat([X[(i, k)] for k in range(j)] + [up], dim=1))
+        return X[(0, self.L)]
+
+
+def _make_decoder(kind, widths, blocks, residual):
+    if kind == "unet":
+        return _UNetDec(widths, blocks, residual)
+    if kind == "unetpp":
+        return _UNetPPDec(widths, residual)
+    raise ValueError(f"--decoder {kind!r} must be 'unet' or 'unetpp'")
+
+
+class FlexNet(nn.Module):
+    """Phase 16 ablation vehicle. Dual(+) per-modality pixel encoders -> symmetric per-level
+    fuse -> two task decoders (fraction / height). Everything configurable; default config
+    mirrors fresh_extract_flex. Patch streams (optional) routed *_s1->height, *_s2->fraction.
+
+    forward(batch{alpha_earth?, tessera?, <patch streams>}) ->
+        {fraction (B,nfrac,256,256), height (B,bins|1,256,256), binary (B,1,256,256)}
+    """
+    def __init__(self, pixel_inputs=("alpha_earth", "tessera"), patch_inputs=(),
+                 enc_widths=(96, 160, 256, 384, 512), enc_blocks=1, enc_block="double",
+                 enc_dilations=1, decoder="unet", dec_blocks=1,
+                 patch_stem_version="v2", patch_fusion="none",
+                 fraction_head="softmax4", height_bins=0, height_mode="shared"):
+        super().__init__()
+        c = list(enc_widths)
+        L = len(c) - 1
+        self.widths = c
+        self.fraction_head = fraction_head
+        self.height_mode = height_mode
+        self.patch_fusion = patch_fusion
+        residual = enc_block in ("residual", "dense")   # 'dense' aliased to residual in v1
+        blocks = [enc_blocks] * L if isinstance(enc_blocks, int) else list(enc_blocks)
+        dils = [enc_dilations] * L if isinstance(enc_dilations, int) else list(enc_dilations)
+        assert len(blocks) == L and len(dils) == L, f"enc-blocks/dilations must have length {L}"
+
+        # pixel side
+        self.pixel_inputs = list(pixel_inputs)
+        if not self.pixel_inputs:
+            raise ValueError("FlexNet requires >=1 pixel input")
+        for n in self.pixel_inputs:
+            if n not in _PIXEL_IN_CH:
+                raise ValueError(f"unknown pixel input {n!r}; choices {list(_PIXEL_IN_CH)}")
+        self.pixel_stems = nn.ModuleDict({n: _ModalityStem(_PIXEL_IN_CH[n], c[0]) for n in self.pixel_inputs})
+        self.pixel_encs = nn.ModuleDict({n: _FlexEncoder(c, blocks, residual, dils) for n in self.pixel_inputs})
+        K = len(self.pixel_inputs)
+        self.fuse = nn.ModuleList([nn.Conv2d(K * c[l], c[l], 1, bias=False) for l in range(L + 1)])
+
+        # patch side (optional; routed by sensor suffix)
+        self.patch_inputs = list(patch_inputs)
+        self._s1 = [n for n in self.patch_inputs if n.endswith("_s1")]
+        self._s2 = [n for n in self.patch_inputs if n.endswith("_s2")]
+        if self.patch_inputs:
+            if patch_fusion == "none":
+                raise ValueError("patch streams given but --patch-fusion none; use add|pyramid")
+            self.tok_stems = nn.ModuleDict(
+                {n: _make_patch_stem(patch_stem_version, 768, c[-1]) for n in self.patch_inputs})
+            if patch_fusion == "add":
+                if self._s1: self.s1_inj = nn.ModuleList([nn.Conv2d(c[-1], c[-1], 1, bias=False),
+                                                          nn.Conv2d(c[-1], c[-2], 1, bias=False)])
+                if self._s2: self.s2_inj = nn.ModuleList([nn.Conv2d(c[-1], c[-1], 1, bias=False),
+                                                          nn.Conv2d(c[-1], c[-2], 1, bias=False)])
+            elif patch_fusion == "pyramid":
+                if len(c) != 5:
+                    raise ValueError("--patch-fusion pyramid currently requires the 5-level default encoder")
+                if self._s1: self.s1_pyr = _TokenPyramid(c)
+                if self._s2: self.s2_pyr = _TokenPyramid(c)
+            else:
+                raise ValueError(f"--patch-fusion {patch_fusion!r} must be none|add|pyramid")
+
+        # decoders + heads
+        self.fraction_decoder = _make_decoder(decoder, c, dec_blocks, residual)
+        self.height_decoder = _make_decoder(decoder, c, dec_blocks, residual)
+        nfrac = 4 if fraction_head == "softmax4" else 3
+        self.nfrac = nfrac
+        self.frac_head = nn.Conv2d(c[0], nfrac, 1)
+        self.binary_head = nn.Conv2d(c[0], 1, 1)
+        self.height_bins = height_bins
+        h_in = c[0] + (nfrac if height_mode == "class_cond" else 0)
+        self.height_head = nn.Conv2d(h_in, height_bins if height_bins > 0 else 1, 1)
+        if height_bins > 0:
+            centers = (torch.arange(height_bins).float() + 0.5) / height_bins * 1.5
+            self.register_buffer("height_centers", centers)
+
+    def _token_grid(self, batch, names):
+        grids = []
+        for n in names:
+            if n in batch:
+                t = self.tok_stems[n](batch[n])              # (B,256,c[-1])
+                B = t.shape[0]
+                grids.append(t.transpose(1, 2).reshape(B, -1, 16, 16))
+        return (sum(grids) / len(grids)) if grids else None
+
+    def _inject_add(self, pyr, tok, inj):
+        pyr = list(pyr)
+        for k, conv in enumerate(inj):                       # k=0 -> bottleneck, k=1 -> one up
+            lvl = len(pyr) - 1 - k
+            t = conv(tok)
+            if t.shape[-2:] != pyr[lvl].shape[-2:]:
+                t = F.interpolate(t, size=pyr[lvl].shape[-2:], mode="bilinear", align_corners=False)
+            pyr[lvl] = pyr[lvl] + t
+        return pyr
+
+    def forward(self, batch):
+        pyrs = [self.pixel_encs[n](self.pixel_stems[n](batch[n])) for n in self.pixel_inputs]
+        pyr = [self.fuse[l](torch.cat([p[l] for p in pyrs], dim=1)) for l in range(len(self.widths))]
+        pyr_h = pyr_f = pyr
+        if self.patch_inputs:
+            tok1 = self._token_grid(batch, self._s1) if self._s1 else None
+            tok2 = self._token_grid(batch, self._s2) if self._s2 else None
+            if self.patch_fusion == "add":
+                if tok1 is not None: pyr_h = self._inject_add(pyr, tok1, self.s1_inj)
+                if tok2 is not None: pyr_f = self._inject_add(pyr, tok2, self.s2_inj)
+            else:  # pyramid
+                if tok1 is not None: pyr_h = self.s1_pyr(tok1, pyr)
+                if tok2 is not None: pyr_f = self.s2_pyr(tok2, pyr)
+        ffeat = self.fraction_decoder(pyr_f)
+        hfeat = self.height_decoder(pyr_h)
+        frac_logits = self.frac_head(ffeat)
+        if self.height_mode == "class_cond":
+            cond = (torch.softmax(frac_logits, dim=1) if self.fraction_head == "softmax4"
+                    else torch.sigmoid(frac_logits)).detach()
+            hfeat = torch.cat([hfeat, cond], dim=1)
+        return {"fraction": frac_logits, "height": self.height_head(hfeat),
+                "binary": self.binary_head(ffeat)}
+
+    def expected_height(self, logits):
+        p = torch.softmax(logits, dim=1)
+        return (p * self.height_centers.view(1, -1, 1, 1)).sum(1, keepdim=True)
+
+    @torch.no_grad()
+    def predict(self, batch):
+        out = self.forward(batch)
+        frac = (torch.softmax(out["fraction"], dim=1)[:, :3] if self.fraction_head == "softmax4"
+                else torch.sigmoid(out["fraction"]))
         h = self.expected_height(out["height"]) if self.height_bins > 0 else out["height"]
         return torch.cat([frac, h], dim=1)
