@@ -1098,3 +1098,50 @@ val = held-out region (never augmented). No thermal events (central 10s monitor 
 
 **Phase-14 verdict:** DA is not a step-change. → Pivot to the reliable end-game: **multi-seed / multi-fold
 ensemble of `ce40`** (roadmap P5, ~+0.005–0.01). Best-honest-rank consolidation; top-3 remains out of reach.
+
+## Phase 15 — Learned multi-scale token decoder + dual-SAR (FreshExtractFlex): NEGATIVE on platform (2026-06-18)
+
+### 46. The `pyramid` token-decoder + dual-SAR (terramind_s1+thor_s1) WINS internally (IoU_W) but does NOT transfer — `15f_pyr_f2` = 0.4335, −0.0078 vs ce40.
+New additive class `FreshExtractFlex` (`fresh_extract_flex`): parametrized pixel inputs (`--pixel-inputs`, per-modality
+encoders — never input-concat, the 6A lesson) + patch streams routed by sensor suffix (*_s1→height, *_s2→fraction) +
+`--patch-fusion {add,pyramid}`. `pyramid` = a DPT-style LEARNED multi-scale token decoder (`_TokenPyramid`: ConvTranspose
+channel→space, NOT interpolation) fused into the routed decoder at all 5 scales via gated zero-init residual. Motivation:
+patches read null before because (a) ce40 ran `--no-use-terramind` = ZERO patch tokens, (b) prior injection touched only the
+2 coarsest levels, (c) the height head was frozen pre-binning. TerraMind (FSQ-VAE) + THOR (ESA Φ-lab, spatial-detail-
+preserving) provably pack sub-patch structure in their 768ch — so a learned token decoder *could* unpack it.
+
+Internal 2-fold ablation (add vs pyramid; data = alpha+tessera pixel / terramind_s1+thor_s1 SAR→height / bins256), best-proxy epoch:
+
+| fold | fusion | proxy | IoU_B | IoU_V | IoU_W | RMSE_B | RMSE_V |
+|------|--------|-------|-------|-------|-------|--------|--------|
+| 0 | add | 0.4433 | 0.309 | 0.824 | 0.587 | 1.91 | 3.52 |
+| 0 | **pyramid** | **0.4632** | 0.311 | 0.827 | **0.719** | 1.90 | 3.56 |
+| 2 | add | 0.4722 | 0.296 | 0.816 | 0.689 | 2.08 | 2.95 |
+| 2 | **pyramid** | **0.4728** | 0.297 | 0.804 | 0.707 | 2.09 | 2.95 |
+
+- **Internally pyramid ≥ add on BOTH held-out folds** — gain ENTIRELY in IoU_W (+0.132 fold0, +0.018 fold2); RMSE_V & IoU_B
+  flat. So the learned decoder is a *water-segmentation* effect, not the canopy-height story it was built for.
+
+Platform (`15f_pyr_f2`, the fold-2 pyramid checkpoint, internal proxy 0.4728, packaged from `model_best.pth`):
+
+| metric | ce40 (best) | 15f_pyr_f2 | Δ |
+|--------|-------------|------------|---|
+| final | **0.4413** | 0.4335 | **−0.0078** |
+| IoU_B | 0.4199 | 0.4100 | −0.0099 |
+| IoU_V | 0.8041 | 0.7976 | −0.0065 |
+| IoU_W | 0.4841 | **0.4658** | **−0.0183** |
+| RMSE_B | 1.972 | 1.976 | −0.004 |
+| RMSE_V | 3.564 | 3.595 | −0.031 |
+
+- **Internal IoU_W 0.707 → platform 0.4658 — not just non-transfer, BELOW ce40 (−0.018).** The pyramid's headline win was a
+  mirage: the extra dual-SAR/pyramid capacity OVERFIT water to the training folds and generalized *worse*. Regressed on every metric.
+- Internal RMSE_V 2.95 → platform 3.60 (back to ce40's level) — confirms fold 2 was just an *easy validation split*, not real.
+- **Same domain-shift wall:** IoU_W internal gains have NEVER transferred (binning give-back = fold-noise; reweighting
+  anti-correlated f40; Phase-14 DA's IoU_W gain cancelled). Adding capacity made transfer WORSE, not better.
+
+**Phase-15 verdict:** the patch/SAR/pyramid direction is NEGATIVE on the platform; `ce40` (0.4413) stays best. Patches were not
+merely "decoded badly" — the SAR signal does not generalize to the held-out regions through more capacity. The residual gap is
+embedding-information / domain-shift limited, not architectural. → **multi-seed ensemble of ce40 remains the only reliable lever.**
+Code (branch `exp-15-token-decoder`): `FreshExtractFlex` + `_TokenPyramid` (additive; `FreshExtract` frozen for ce40 repro);
+`predict.py` reads PIXEL_INPUTS/PATCH_FUSION. NOTE: head's `15f_pyr_f2` was killed at epoch 35 by a stray test thermal-watchdog
+(`pkill -f train.py`); the run had plateaued (proxy ~0.472 from e29) so the e31 `model_best.pth` was packaged as-is.
