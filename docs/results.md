@@ -1145,3 +1145,34 @@ embedding-information / domain-shift limited, not architectural. → **multi-see
 Code (branch `exp-15-token-decoder`): `FreshExtractFlex` + `_TokenPyramid` (additive; `FreshExtract` frozen for ce40 repro);
 `predict.py` reads PIXEL_INPUTS/PATCH_FUSION. NOTE: head's `15f_pyr_f2` was killed at epoch 35 by a stray test thermal-watchdog
 (`pkill -f train.py`); the run had plateaued (proxy ~0.472 from e29) so the e31 `model_best.pth` was packaged as-is.
+
+### 47. Data-source ablation (FreshExtractFlex, fold 0) — alpha+tessera carry ALL the signal; patch FMs add nothing transferable.
+The Phase-15 negative (f46) was concluded from one config; this is the missing attribution. `fresh_extract_flex`
+flag sweep on held-out fold 0, ce40 recipe (bins256 ce0.4, 40 ep). bs24 except all-four (bs16, OOM at bs24 — two
+`_TokenPyramid` decoders + 4 token stems exceed 47 GB). Best-proxy epoch:
+
+| data config | proxy | IoU_B | IoU_V | IoU_W | RMSE_B | RMSE_V |
+|-------------|-------|-------|-------|-------|--------|--------|
+| alpha only (no patch) | 0.4054 | 0.241 | 0.808 | 0.689 | 2.16 | 3.89 |
+| tessera only (no patch) | 0.4128 | 0.280 | 0.816 | 0.647 | 2.03 | 4.22 |
+| **alpha+tessera (no patch)** | **0.4526** | 0.313 | 0.822 | 0.649 | 1.92 | 3.53 |
+| + tm_s1+thor_s1, add | 0.4433 | 0.309 | 0.824 | 0.587 | 1.91 | 3.52 |
+| + tm_s1+thor_s1, pyramid | 0.4632 | 0.311 | 0.827 | 0.719 | 1.90 | 3.56 |
+| + all-four patches, pyramid (bs16) | 0.4587 | 0.305 | 0.823 | 0.697 | 1.88 | 3.57 |
+
+- **Dual pixel encoder is essential (7A claim-1, finally confirmed).** alpha-only 0.405 / tessera-only 0.413 / both
+  **0.453** (+0.040 over the better single). Single-modality height is at/over the 3.9 m cliff (3.89 / 4.22) and
+  IoU_B collapses (0.24 / 0.28); combined → RMSE_V 3.53, IoU_B 0.313. Genuinely complementary, not redundant.
+- **Patches add no robust value.** pixel-only (0.4526) **beats** the coarse `add` injection (0.4433 — patches HURT);
+  `pyramid` tops pixel-only by only **+0.011, and entirely in IoU_W** (0.719 vs 0.649) — the exact water gain that
+  **did NOT transfer** (platform `15f_pyr_f2`: IoU_W −0.018 vs ce40). Optical streams (all-four, s2→fraction) ≤
+  dual-SAR pyramid → no contribution. ce40 recipe on this fold (`14_da0_f0` = 0.4559) ≈ flex pixel-only (0.4526),
+  i.e. **ce40 IS the alpha+tessera pixel signal, and that is the ceiling.**
+- **Attribution of the f46 negative:** the TerraMind/THOR patch FMs contribute no usable, transferable signal at
+  10 m; alpha+tessera pixels carry the entire signal (both needed). The pyramid's only internal edge was
+  non-transferring water overfit. The coarse 16×16 patch tokens are redundant with the already-fused AlphaEarth
+  pixel embedding (matches the lit-review prior).
+
+**f47 verdict:** patch/token fusion is DEFINITIVELY closed (add hurts, pyramid = non-transferring IoU_W, optical
+null, all attributed). `ce40` (0.4413) is at the data ceiling for the pixel embeddings we have. The only remaining
+reliable lever is the **multi-seed / multi-fold ensemble of `ce40`** (~+0.005–0.01). Best-honest-rank consolidation.
