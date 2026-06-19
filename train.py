@@ -151,6 +151,12 @@ def parse_args():
     parser.add_argument("--grad-checkpoint", action="store_true",
                         help="[flexnet] gradient-checkpoint encoder stages + decoder nodes (recompute in "
                              "backward) to fit memory-heavy configs (e.g. U-Net++) at bs16.")
+    parser.add_argument("--ema", action="store_true",
+                        help="[Phase 17] track an EMA of weights; evaluate + save the EMA model "
+                             "(flatter minimum -> better train->test transfer). Model-agnostic.")
+    parser.add_argument("--ema-decay", type=float, default=0.999, help="EMA decay (default 0.999).")
+    parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY,
+                        help=f"AdamW weight decay (default {WEIGHT_DECAY}); raise for more regularization.")
     parser.add_argument("--experiment-name", type=str, default=EXPERIMENT_NAME)
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     parser.add_argument("--patch-size", type=int, default=PATCH_SIZE)
@@ -699,6 +705,30 @@ def evaluate_7a(model, val_loader, criterion, device, C=4.0, amp=False,
     }
 
 
+class _EMA:
+    """Exponential moving average of model weights (params + buffers). The EMA copy is
+    what we evaluate + save as model_best — a flatter-minimum / better-transfer solution
+    (the cheap, schedule-agnostic version of SWA; GroupNorm => no BN-stat recompute needed)."""
+    def __init__(self, model, decay):
+        self.decay = decay
+        self.shadow = {k: v.detach().clone() for k, v in model.state_dict().items()}
+
+    @torch.no_grad()
+    def update(self, model):
+        for k, v in model.state_dict().items():
+            s = self.shadow[k]
+            if s.is_floating_point():
+                s.mul_(self.decay).add_(v.detach(), alpha=1.0 - self.decay)
+            else:
+                s.copy_(v)
+
+    def copy_to(self, model):
+        model.load_state_dict(self.shadow, strict=True)
+
+    def state_dict(self):
+        return self.shadow
+
+
 def train_7a(args):
     # Global reproducibility seed (overrides the module-level default seed).
     torch.manual_seed(args.seed)
@@ -818,6 +848,9 @@ def train_7a(args):
         f.write(f"DEC_BLOCKS: {args.dec_blocks}\n")
         f.write(f"HEIGHT_MODE: {args.height_mode}\n")
         f.write(f"GRAD_CHECKPOINT: {args.grad_checkpoint}\n")
+        f.write(f"EMA: {args.ema}\n")
+        f.write(f"EMA_DECAY: {args.ema_decay}\n")
+        f.write(f"WEIGHT_DECAY: {args.weight_decay}\n")
         f.write(f"PATCH_STEM_VERSION: {args.patch_stem_version}\n")
         f.write(f"XATTN_HEADS: {args.xattn_heads}\n")
         f.write(f"PATCH_ROUTING: {args.patch_routing}\n")
@@ -938,8 +971,11 @@ def train_7a(args):
                              height_bins=args.height_bins,
                              height_ce_weight=args.height_ce_weight,
                              dice_k=args.dice_k).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    ema = _EMA(model, args.ema_decay) if args.ema else None
+    if ema is not None:
+        print(f"   >> EMA on (decay={args.ema_decay}) — eval+save the averaged weights; wd={args.weight_decay}")
 
     # Drop the binary task entirely when the aux head is disabled, so GradNorm /
     # static weighting never sees a constant-zero loss (which would NaN GradNorm).
@@ -997,6 +1033,8 @@ def train_7a(args):
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
+            if ema is not None:
+                ema.update(model)
 
             bs = target.size(0)
             running += float(loss.detach()) * bs; seen += bs
@@ -1019,20 +1057,27 @@ def train_7a(args):
             # No validation set: save the current model every epoch (the final
             # model is the last epoch) and log train loss only.
             proxy_hist.append(epoch_loss)
-            torch.save(model.state_dict(), best_path)   # = latest; predict.py loads model_best
+            torch.save(ema.state_dict() if ema is not None else model.state_dict(), best_path)   # = latest; predict.py loads model_best
             print(f"Epoch {epoch+1}/{args.epochs} | train {epoch_loss:.4f} | "
                   f"(no-holdout, saved){gn_str}")
             with open(cfg_path, "a") as f:
                 f.write(f"Epoch {epoch+1}: train={epoch_loss:.4f} (no-holdout) "
                         f"task_train={ep_task}{gn_str}\n")
         else:
-            metrics = evaluate_7a(model, val_loader, criterion, device, amp=args.amp,
-                                  fraction_head=args.fraction_head)
+            if ema is not None:
+                _bak = {k: v.detach().clone() for k, v in model.state_dict().items()}
+                ema.copy_to(model)
+                metrics = evaluate_7a(model, val_loader, criterion, device, amp=args.amp,
+                                      fraction_head=args.fraction_head)
+                model.load_state_dict(_bak)   # restore raw weights for continued training
+            else:
+                metrics = evaluate_7a(model, val_loader, criterion, device, amp=args.amp,
+                                      fraction_head=args.fraction_head)
             proxy_hist.append(metrics["proxy"])
 
             if metrics["proxy"] > best_proxy:
                 best_proxy = metrics["proxy"]
-                torch.save(model.state_dict(), best_path)
+                torch.save(ema.state_dict() if ema is not None else model.state_dict(), best_path)
                 tag = "  *** new best ***"
             else:
                 tag = ""
@@ -1048,7 +1093,7 @@ def train_7a(args):
                         f"RMSE_V={metrics['rmse_v']:.3f} task_train={ep_task} "
                         f"val_task={metrics['val_task_losses']}{gn_str}\n")
 
-    torch.save(model.state_dict(), last_path)
+    torch.save(ema.state_dict() if ema is not None else model.state_dict(), last_path)
     total_min = (time.time() - total_start) / 60
     summary = (f"final train loss={train_hist[-1]:.4f} (no-holdout)" if no_holdout
                else f"best proxy={best_proxy:.4f}")
