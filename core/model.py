@@ -2,6 +2,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as _ckpt
 
 
 # ==========================================
@@ -348,7 +349,8 @@ def build_model(model_type, n_channels, n_classes, use_height_bridge=True,
                 height_bins=0,
                 pixel_inputs=("alpha_earth", "tessera"), patch_fusion="add",
                 enc_widths=(96, 160, 256, 384, 512), enc_blocks=1, enc_block="double",
-                enc_dilations=1, decoder="unet", dec_blocks=1, height_mode="shared"):
+                enc_dilations=1, decoder="unet", dec_blocks=1, height_mode="shared",
+                grad_checkpoint=False):
     selected = model_type.lower()
 
     if selected == "auto":
@@ -399,6 +401,7 @@ def build_model(model_type, n_channels, n_classes, use_height_bridge=True,
             enc_dilations=enc_dilations, decoder=decoder, dec_blocks=dec_blocks,
             patch_stem_version=patch_stem_version, patch_fusion=patch_fusion,
             fraction_head=fraction_head, height_bins=height_bins, height_mode=height_mode,
+            grad_checkpoint=grad_checkpoint,
         ), selected
 
     raise ValueError(
@@ -1387,16 +1390,18 @@ class _EncStageF(nn.Module):
 
 class _FlexEncoder(nn.Module):
     """stem_out (widths[0] @256) -> pyramid [widths[0]@256, widths[1]@128, ... widths[L]@(256/2^L)]."""
-    def __init__(self, widths, blocks, residual, dilations):
+    def __init__(self, widths, blocks, residual, dilations, ckpt=False):
         super().__init__()
         L = len(widths) - 1
+        self.ckpt = ckpt
         self.stages = nn.ModuleList([
             _EncStageF(widths[i], widths[i + 1], blocks[i], residual, dilations[i]) for i in range(L)])
     def forward(self, x0):
         feats = [x0]
         x = x0
         for st in self.stages:
-            x = st(x); feats.append(x)
+            x = _ckpt.checkpoint(st, x, use_reentrant=False) if (self.ckpt and self.training) else st(x)
+            feats.append(x)
         return feats
 
 
@@ -1417,23 +1422,26 @@ class _UpF(nn.Module):
 
 class _UNetDec(nn.Module):
     """Plain U-Net decoder over a configurable pyramid -> widths[0] @256."""
-    def __init__(self, widths, blocks, residual):
+    def __init__(self, widths, blocks, residual, ckpt=False):
         super().__init__()
         L = len(widths) - 1
+        self.ckpt = ckpt
         self.ups = nn.ModuleList([_UpF(widths[i], widths[i - 1], widths[i - 1], blocks, residual)
                                   for i in range(L, 0, -1)])
     def forward(self, pyr):
         x = pyr[-1]
         for k, up in enumerate(self.ups):
-            x = up(x, pyr[-2 - k])
+            skip = pyr[-2 - k]
+            x = _ckpt.checkpoint(up, x, skip, use_reentrant=False) if (self.ckpt and self.training) else up(x, skip)
         return x
 
 
 class _UNetPPDec(nn.Module):
     """U-Net++ nested dense skips -> widths[0] @256. Node X[i,j] = conv(concat(X[i,0..j-1], up(X[i+1,j-1])))."""
-    def __init__(self, widths, residual):
+    def __init__(self, widths, residual, ckpt=False):
         super().__init__()
         self.L = len(widths) - 1
+        self.ckpt = ckpt
         self.up = nn.ModuleDict()
         self.node = nn.ModuleDict()
         for j in range(1, self.L + 1):
@@ -1450,15 +1458,17 @@ class _UNetPPDec(nn.Module):
                 up = self.up[f"{i}_{j}"](X[(i + 1, j - 1)])
                 if up.shape[-2:] != X[(i, 0)].shape[-2:]:
                     up = F.interpolate(up, size=X[(i, 0)].shape[-2:], mode="bilinear", align_corners=False)
-                X[(i, j)] = self.node[f"{i}_{j}"](torch.cat([X[(i, k)] for k in range(j)] + [up], dim=1))
+                cat = torch.cat([X[(i, k)] for k in range(j)] + [up], dim=1)
+                nd = self.node[f"{i}_{j}"]
+                X[(i, j)] = _ckpt.checkpoint(nd, cat, use_reentrant=False) if (self.ckpt and self.training) else nd(cat)
         return X[(0, self.L)]
 
 
-def _make_decoder(kind, widths, blocks, residual):
+def _make_decoder(kind, widths, blocks, residual, ckpt=False):
     if kind == "unet":
-        return _UNetDec(widths, blocks, residual)
+        return _UNetDec(widths, blocks, residual, ckpt=ckpt)
     if kind == "unetpp":
-        return _UNetPPDec(widths, residual)
+        return _UNetPPDec(widths, residual, ckpt=ckpt)
     raise ValueError(f"--decoder {kind!r} must be 'unet' or 'unetpp'")
 
 
@@ -1474,11 +1484,13 @@ class FlexNet(nn.Module):
                  enc_widths=(96, 160, 256, 384, 512), enc_blocks=1, enc_block="double",
                  enc_dilations=1, decoder="unet", dec_blocks=1,
                  patch_stem_version="v2", patch_fusion="none",
-                 fraction_head="softmax4", height_bins=0, height_mode="shared"):
+                 fraction_head="softmax4", height_bins=0, height_mode="shared",
+                 grad_checkpoint=False):
         super().__init__()
         c = list(enc_widths)
         L = len(c) - 1
         self.widths = c
+        self.ckpt = grad_checkpoint
         self.fraction_head = fraction_head
         self.height_mode = height_mode
         self.patch_fusion = patch_fusion
@@ -1495,7 +1507,7 @@ class FlexNet(nn.Module):
             if n not in _PIXEL_IN_CH:
                 raise ValueError(f"unknown pixel input {n!r}; choices {list(_PIXEL_IN_CH)}")
         self.pixel_stems = nn.ModuleDict({n: _ModalityStem(_PIXEL_IN_CH[n], c[0]) for n in self.pixel_inputs})
-        self.pixel_encs = nn.ModuleDict({n: _FlexEncoder(c, blocks, residual, dils) for n in self.pixel_inputs})
+        self.pixel_encs = nn.ModuleDict({n: _FlexEncoder(c, blocks, residual, dils, ckpt=self.ckpt) for n in self.pixel_inputs})
         K = len(self.pixel_inputs)
         self.fuse = nn.ModuleList([nn.Conv2d(K * c[l], c[l], 1, bias=False) for l in range(L + 1)])
 
@@ -1522,8 +1534,8 @@ class FlexNet(nn.Module):
                 raise ValueError(f"--patch-fusion {patch_fusion!r} must be none|add|pyramid")
 
         # decoders + heads
-        self.fraction_decoder = _make_decoder(decoder, c, dec_blocks, residual)
-        self.height_decoder = _make_decoder(decoder, c, dec_blocks, residual)
+        self.fraction_decoder = _make_decoder(decoder, c, dec_blocks, residual, ckpt=self.ckpt)
+        self.height_decoder = _make_decoder(decoder, c, dec_blocks, residual, ckpt=self.ckpt)
         nfrac = 4 if fraction_head == "softmax4" else 3
         self.nfrac = nfrac
         self.frac_head = nn.Conv2d(c[0], nfrac, 1)

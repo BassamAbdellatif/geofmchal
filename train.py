@@ -148,6 +148,9 @@ def parse_args():
     parser.add_argument("--dec-blocks", type=int, default=1, help="[flexnet] refine blocks per decoder up-stage.")
     parser.add_argument("--height-mode", type=str, default="shared", choices=["shared", "class_cond"],
                         help="[flexnet] 'class_cond' conditions the height head on the fraction prediction.")
+    parser.add_argument("--grad-checkpoint", action="store_true",
+                        help="[flexnet] gradient-checkpoint encoder stages + decoder nodes (recompute in "
+                             "backward) to fit memory-heavy configs (e.g. U-Net++) at bs16.")
     parser.add_argument("--experiment-name", type=str, default=EXPERIMENT_NAME)
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     parser.add_argument("--patch-size", type=int, default=PATCH_SIZE)
@@ -814,6 +817,7 @@ def train_7a(args):
         f.write(f"DECODER: {args.decoder}\n")
         f.write(f"DEC_BLOCKS: {args.dec_blocks}\n")
         f.write(f"HEIGHT_MODE: {args.height_mode}\n")
+        f.write(f"GRAD_CHECKPOINT: {args.grad_checkpoint}\n")
         f.write(f"PATCH_STEM_VERSION: {args.patch_stem_version}\n")
         f.write(f"XATTN_HEADS: {args.xattn_heads}\n")
         f.write(f"PATCH_ROUTING: {args.patch_routing}\n")
@@ -915,7 +919,7 @@ def train_7a(args):
                            patch_fusion=args.patch_fusion,
                            enc_widths=_ew, enc_blocks=_eb, enc_block=args.enc_block,
                            enc_dilations=_ed, decoder=args.decoder, dec_blocks=args.dec_blocks,
-                           height_mode=args.height_mode)
+                           height_mode=args.height_mode, grad_checkpoint=args.grad_checkpoint)
     model = model.to(device)
     print(f"   >> params: {sum(p.numel() for p in model.parameters())/1e6:.2f}M"
           f"  (height_bridge={'off' if args.no_height_bridge else 'on'})")
