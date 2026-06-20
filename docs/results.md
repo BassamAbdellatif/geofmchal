@@ -1176,3 +1176,31 @@ flag sweep on held-out fold 0, ce40 recipe (bins256 ce0.4, 40 ep). bs24 except a
 **f47 verdict:** patch/token fusion is DEFINITIVELY closed (add hurts, pyramid = non-transferring IoU_W, optical
 null, all attributed). `ce40` (0.4413) is at the data ceiling for the pixel embeddings we have. The only remaining
 reliable lever is the **multi-seed / multi-fold ensemble of `ce40`** (~+0.005–0.01). Best-honest-rank consolidation.
+
+## Phase 16/17 — FlexNet U-Net++ + EMA: NEW BEST (2026-06-20)
+
+### 49. PLATFORM: `17_unetpp_ema_f1` = 0.4521, rank 29 (from 30) — +0.0108 over ce40; U-Net++ (full data) + EMA TRANSFERS.
+flexnet, U-Net++ decoder (`--decoder unetpp --grad-checkpoint`), pixel-only (alpha+tessera), bins256,
+**EMA weight-averaging (--ema, decay 0.999)**, cv-fold 1, bs16, 40 ep. Internal fold-1 proxy 0.4891.
+
+| metric | ce40 (0.4413) | **17_unetpp_ema_f1 (0.4521)** | Δ platform | internal (fold1) |
+|--------|---------------|------------------------------|------------|------------------|
+| final  | 0.4413 | **0.4521** | **+0.0108** | 0.4891 |
+| IoU_B  | 0.4199 | **0.4312** | **+0.0113** | 0.360 |
+| IoU_V  | 0.8041 | 0.8078 | +0.0037 | 0.785 |
+| IoU_W  | 0.4841 | 0.4895 | +0.0054 | 0.716 |
+| RMSE_B | 1.972  | 1.942  | +0.030m | 1.74 |
+| RMSE_V | 3.564  | 3.462  | **+0.102m** | 3.35 |
+
+- **The win transferred through the CREDIBLE metrics, not the mirage.** Internal lift was IoU_W-heavy
+  (+0.081) — and as predicted that IoU_W did NOT transfer (internal 0.716 → platform 0.4895 ≈ ce40). But
+  **IoU_B (+0.0113, our biggest gap) and RMSE_V (+0.102m) DID transfer.** Real architecture/EMA gain, not luck.
+- **Overturns f48 ("architecture saturated").** The fast-screen (single-fold, ~20% data) showed U-Net++ a
+  wash (f48); at FULL cv-fold-1 data + EMA it's a clear platform gain → f35's "capacity needs data" again.
+- **Confound:** unetpp + EMA + full-data combined; ce40+EMA internal was *lower* than ce40 (−0.008) so EMA
+  alone is not the driver — U-Net++ at full data is likely the main lever. To isolate: unetpp NO-EMA next.
+- **First platform gain since binning (f44).** Reopens architecture+generalization as productive.
+
+**Next (now justified):** (a) "room to grow" — extend epochs (60, T_max 60) + EMA decay 0.995 (the EMA proxy
+was still rising at ep40); (b) isolate U-Net++ vs EMA; (c) no-holdout + multi-seed ensemble of unetpp+EMA
+for the final. Best = `17_unetpp_ema_f1` 0.4521 rank 29. #1 = 0.5761 (gap 0.124).
