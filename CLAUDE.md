@@ -17,7 +17,15 @@ score = 0.25×IoU_B + 0.15×IoU_V + 0.15×IoU_W
 - IoU is hard binary at threshold 0.5 on abundance predictions.
 - The proxy in train.py uses C=4.0 (close enough; do not change without rerunning all proxy comparisons).
 
-## Our Current Platform Metrics (best submission: `13_bins256_ce40_b24_f1` = 0.4413, rank 30 — 2026-06-14)
+## Our Current Platform Metrics
+> **BEST = `17_unetpp_ema_f1` = 0.4521, rank 29 (2026-06-20, f49).** flexnet U-Net++ decoder + EMA
+> weight-averaging, pixel-only (alpha+tessera), bins256, cv-fold 1. +0.0108 over ce40 — transferred via
+> **IoU_B 0.4312 (+0.011) and RMSE_V 3.462 (+0.10m)**; internal IoU_W lift did NOT transfer (mirage, as
+> predicted). Overturns the "architecture saturated" read (f48): U-Net++ helps at FULL data + EMA (the
+> 20%-data fast-screen missed it). #1 = 0.5761 (gap 0.124). Next: extend epochs/EMA-decay ("room to grow"),
+> isolate U-Net++ vs EMA, no-holdout + multi-seed ensemble. Code on branch `exp-16-flexnet`.
+
+### (prior best) `13_bins256_ce40_b24_f1` = 0.4413, rank 30 — 2026-06-14
 Unrealized-score = weight × normalized gap to #1 (RMSE normalized by 3.9). Total room to #1 = 0.103.
 | Metric   | Us (`ce40`) | prev (`bins256_ce20`) | #1 leader | unrealized score |
 |----------|-------------|-----------------------|-----------|------------------|
