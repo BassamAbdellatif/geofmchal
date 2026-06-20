@@ -180,6 +180,10 @@ _DEFAULT_NORM_STATS = os.path.join(_REPO_ROOT, "data", "norm_stats.json")
 
 # Strata weights for WeightedRandomSampler: index = stratum (0=empty, 1=sparse, 2=medium, 3=dense)
 _STRATA_WEIGHTS = [1.0, 1.5, 2.0, 3.0]
+# [Phase 17] strata-adaptive augmentation: per-stratum multiplier on domain_aug_scale.
+# Rare-class (dense building/water) tiles are oversampled -> give them MORE jitter variety
+# to fight overfitting; empty tiles get LESS. index = stratum (0=empty .. 3=dense).
+_STRATA_AUG_MULT = [0.5, 1.0, 1.5, 2.0]
 
 
 def find_multimodal_train_tiles(data_root, use_thor=False):
@@ -401,6 +405,7 @@ class GeoFMDataset7A(Dataset):
         patch_inputs=("terramind_s1", "terramind_s2"),
         include_folds=None,
         domain_aug_scale=1.0,
+        strata_aug=False,
     ):
         # Active THOR patch streams (subset of thor_s1, thor_s2). When empty the
         # dataset behaves byte-identically to the pre-Phase-5D version: same cache
@@ -444,6 +449,18 @@ class GeoFMDataset7A(Dataset):
                 )
 
         self._coverage_scores = self._compute_coverage_scores()
+
+        # [Phase 17] strata-adaptive augmentation: precompute a per-tile domain-aug
+        # multiplier from each tile's coverage stratum (train-only). Same stratum cuts
+        # as the sampler (tertiles of positive coverage).
+        self.strata_aug = bool(strata_aug) and is_train
+        if self.strata_aug:
+            scores = np.asarray(self._coverage_scores, dtype=np.float64)
+            pos = scores[scores > 0]
+            q = np.quantile(pos, [1.0/3.0, 2.0/3.0]) if pos.size >= 3 else np.array([1e-6, 2e-6])
+            def _stratum(s):
+                return 0 if s <= 0 else int(1 + np.searchsorted(q, s, side="right"))
+            self._tile_aug_mult = [_STRATA_AUG_MULT[min(_stratum(s), 3)] for s in scores]
 
         # Optional memmap-backed float16 cache of the deterministic preprocessed
         # tiles (sanitize+pad+reshape+norm). Built once; workers mmap it
@@ -651,7 +668,10 @@ class GeoFMDataset7A(Dataset):
             }
             for n in self._thor_streams:
                 emb_dict[n] = thor[n]
-            emb_dict = augment_domain_shift(emb_dict, self.norm_stats, rng, scale=self.domain_aug_scale)
+            aug_scale = self.domain_aug_scale
+            if getattr(self, "strata_aug", False):
+                aug_scale = aug_scale * self._tile_aug_mult[idx]   # more jitter for rare-class strata
+            emb_dict = augment_domain_shift(emb_dict, self.norm_stats, rng, scale=aug_scale)
 
             k    = int(rng.integers(0, 4))
             flip = bool(rng.integers(0, 2))
