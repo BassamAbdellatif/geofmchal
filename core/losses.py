@@ -207,6 +207,15 @@ def _soft_dice(pred, target, smooth=1.0):
     return torch.mean(1.0 - dice)
 
 
+def _soft_dice_per_sample(pred, target, smooth=1.0):
+    """Soft Dice over (B,H,W) prob vs binary target, returned PER SAMPLE -> (B,).
+    Used to drop rare-class (water) supervision on pseudo-labeled tiles (Phase 18)."""
+    dims = tuple(range(1, pred.dim()))
+    inter = torch.sum(pred * target, dim=dims)
+    denom = torch.sum(pred, dim=dims) + torch.sum(target, dim=dims)
+    return 1.0 - (2.0 * inter + smooth) / (denom + smooth)
+
+
 def _soft_tversky(pred, target, alpha, beta, gamma=1.0, smooth=1.0):
     """(Focal) Tversky loss over (B,H,W) prob vs binary target (per-sample, mean over batch).
 
@@ -302,9 +311,13 @@ class DualPathLoss(nn.Module):
         gamma = self.focal_tversky_gamma if self.building_overlap == "focal_tversky" else 1.0
         return _soft_tversky(pred_c, tgt_c, self.tversky_alpha, self.tversky_beta, gamma)
 
-    def _fraction_loss(self, frac_logits, frac_target):
+    def _fraction_loss(self, frac_logits, frac_target, pseudo_mask=None):
         """Fraction-path loss. Default (sigmoid3 + class-blind dice) is byte-identical
-        to the pre-Phase-9 path; other configs take a per-channel / softmax branch."""
+        to the pre-Phase-9 path; other configs take a per-channel / softmax branch.
+        [Phase 18] pseudo_mask (B,) (1.0 = pseudo tile): when given (softmax4 path only),
+        the WATER channel (idx 2) supervision is dropped for pseudo samples — water has no
+        dedicated head, so naive pseudo-labels wash it out (f52). Building/veg/other keep
+        pseudo-supervision (building survives via its binary head)."""
         is_default = (self.fraction_head == "sigmoid3"
                       and self.building_overlap == "dice"
                       and self.building_overlap_weight == 1.0
@@ -323,13 +336,22 @@ class DualPathLoss(nn.Module):
             other = (1.0 - frac_target.sum(dim=1)).clamp(0.0, 1.0)       # (B,H,W)
             target4 = torch.cat([frac_target, other.unsqueeze(1)], dim=1)  # (B,4,H,W)
             prob = torch.softmax(frac_logits, dim=1)                     # (B,4,H,W)
-            loss_mae = torch.mean(torch.abs(prob - target4))
-            # Overlap on the 3 supervised goal channels (building-aware on ch0);
-            # 'other' is a derived sink — MAE only, no overlap term.
             b = self.building_overlap_weight * self._building_overlap_term(
                 prob[:, 0], (target4[:, 0] > 0.5).float())
             v = _soft_dice(prob[:, 1], (target4[:, 1] > 0.5).float())
-            w = _soft_dice(prob[:, 2], (target4[:, 2] > 0.5).float())
+            if pseudo_mask is None:
+                # --- original softmax4 path (byte-identical) ---
+                loss_mae = torch.mean(torch.abs(prob - target4))
+                w = _soft_dice(prob[:, 2], (target4[:, 2] > 0.5).float())
+            else:
+                # [Phase 18] drop water-channel supervision for pseudo samples.
+                real = (1.0 - pseudo_mask).clamp(0.0, 1.0)              # (B,) 1=real
+                ae = torch.abs(prob - target4)                          # (B,4,H,W)
+                wmask = torch.ones_like(ae)
+                wmask[:, 2] = real.view(-1, 1, 1)                       # zero water for pseudo
+                loss_mae = (ae * wmask).sum() / wmask.sum().clamp_min(1.0)
+                w_ps = _soft_dice_per_sample(prob[:, 2], (target4[:, 2] > 0.5).float())  # (B,)
+                w = (w_ps * real).sum() / real.sum().clamp_min(1.0)
             loss_overlap = (b + v + w) / 3.0
             return loss_mae + self.dice_lambda * loss_overlap
 
@@ -345,7 +367,7 @@ class DualPathLoss(nn.Module):
         loss_overlap = (b + v + w) / 3.0
         return loss_mae + self.dice_lambda * loss_overlap
 
-    def forward(self, outputs, target):
+    def forward(self, outputs, target, pseudo_mask=None):
         frac_logits = outputs["fraction"]          # (B,3|4,H,W)
 
         frac_target = target[:, :3]                # (B,3,H,W) in [0,1]
@@ -353,7 +375,7 @@ class DualPathLoss(nn.Module):
         build_frac = target[:, 0]
         veg_frac = target[:, 1]
 
-        loss_fraction = self._fraction_loss(frac_logits, frac_target)
+        loss_fraction = self._fraction_loss(frac_logits, frac_target, pseudo_mask=pseudo_mask)
 
         # Per-pixel height loss. [Phase 13a] discrete-continuous when the adaptive-bin head
         # is on (CE over N bins + Huber on the soft-expectation); else legacy scalar Huber.

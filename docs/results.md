@@ -1256,3 +1256,39 @@ combined into a diverse **ensemble** for the final submission; one cheap uncerta
 - **Verdict:** specialization is a wash → closes the architecture/specialization line (f48→f50→f51). The leader
   gap is not task interference. The remaining untried high-ceiling lever is **pseudo-labeling / self-training on
   the target** (attacks the actual train→test transfer gap). Best stays `17_unetpp_ema_f1` = 0.4521 rank 29.
+
+## Phase 18 — Naive pseudo-labeling / self-training: NEGATIVE (IoU_W tax) (2026-06-22)
+
+### 52. Naive (unfiltered, soft) pseudo-labeling is net-negative — it taxes the rare class (water).
+Self-training screen via the **fold-1-as-target trick**: pseudo-label fold 1 with base `17_unetpp_ema_f1`
+(396 soft 4-band tifs), train on {0,2,3,4}-real + fold-1-pseudo, eval fold-1 **REAL**. Recipe = base exactly
+(flexnet unetpp+EMA+grad-ckpt, bs16). Two inits run as an A/B; **base (0.4891) is the single-variable control**.
+
+| run | init | proxy | IoU_B | IoU_V | **IoU_W** | RMSE_B | RMSE_V |
+|-----|------|-------|-------|-------|-----------|--------|--------|
+| base `17_unetpp_ema_f1` (control) | — | **0.4891** | 0.360 | 0.785 | **0.716** | 1.74 | 3.35 |
+| `18_pseudo_warm_f1` (ep19/20) | warm-start from base | 0.4681 | 0.367 | 0.785 | **0.601** | 1.78 | 3.41 |
+| `18_pseudo_f1` (ep20/40, killed) | from scratch | 0.4416↑ | 0.358 | 0.784 | **0.523*** | 1.94↓ | 3.46↓ |
+
+(*from-scratch IoU_W **plateaued** at ~0.52 over ep14-20 while RMSE still converging → projected final
+≈0.456. Killed at ep20: verdict sealed, head is the scarce resource.)
+
+- **Both inits net-negative vs base; the entire deficit is IoU_W** (water). Every other metric matches base
+  (IoU_B even slightly *up*, 0.367 vs 0.360; RMSE within noise).
+- **Mechanism = confirmation bias on the rare class.** Pseudo-labels are base's own *soft* water predictions,
+  which are systematically **under-confident**; both the MAE and the binarized-dice term (`(target>0.5)`) then
+  teach the model to predict *less* water → fewer pixels cross the 0.5 IoU threshold → IoU_W collapses
+  (0.716 → 0.60 warm / ~0.52 cold). The earlier "warm-start ≈ near-identity" prediction was **wrong**: the
+  zero-gradient logic only holds for the *confident* classes (IoU_B/V, RMSE all flat); the uncertain rare class
+  actively degrades.
+- **Why water and not building?** Dovetails with f23-24: **building survives via its dedicated binary head;
+  water has no dedicated supervision**, so pseudo washes out the only water signal fold-1 had. Water is uniquely
+  fragile to self-training.
+- warm-start *recovers* water slowly (still sees real water in the 4 folds, 0.537→0.601); from-scratch *plateaus*
+  low (no good water prior to anchor it). Both end below base.
+- **Caveat:** fold-1 is in-distribution (same French regions as train), so the screen shows the *transfer* metrics
+  flat (no gain) — it cannot capture pseudo-labeling's potential benefit on the *genuinely shifted* test set
+  (different regions/years), which is unvalidatable pre-submission.
+- **Verdict:** naive pseudo-labeling is a dead end *as-is* — it attacks our single most valuable weak metric
+  (IoU_W). Next: **rare-class-aware** variant = drop water-channel pseudo-supervision (per-sample mask; water
+  learned from real folds only), keep building/veg/height pseudo. Best stays `17_unetpp_ema_f1` = 0.4521 rank 29.

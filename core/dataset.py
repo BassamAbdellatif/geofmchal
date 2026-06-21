@@ -728,4 +728,8 @@ class GeoFMDataset7A(Dataset):
         }
         for n in self._thor_streams:
             out[n] = torch.from_numpy(thor[n])
+        # [Phase 18] per-sample pseudo flag (1.0 = this tile's target is a pseudo-label).
+        # Consumed by the train loop to mask rare-class pseudo-supervision; the model
+        # indexes the batch by name so this extra key is ignored by forward/predict.
+        out["is_pseudo"] = torch.tensor(float(self._is_pseudo[idx]))
         return out

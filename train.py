@@ -278,6 +278,10 @@ def parse_args():
                              "Tiles whose geo-fold is in --pseudo-folds load their TARGET from here.")
     parser.add_argument("--pseudo-folds", type=str, default=None,
                         help="[Phase 18] comma geo-folds whose tiles use pseudo-labels (train only).")
+    parser.add_argument("--pseudo-mask-water", action="store_true",
+                        help="[Phase 18] rare-class-aware: drop WATER-channel pseudo-supervision on "
+                             "pseudo tiles (softmax4 only). Water learned from real folds; avoids the "
+                             "IoU_W tax of naive pseudo-labeling (f52).")
     parser.add_argument("--cache-dir", type=str, default=None,
                         help="[7A] Directory for the memmap float16 tile cache. If set, "
                              "tiles are preprocessed once and served from the (page-cached) "
@@ -867,6 +871,7 @@ def train_7a(args):
         f.write(f"INIT_WEIGHTS: {args.init_weights}\n")
         f.write(f"PSEUDO_LABEL_DIR: {args.pseudo_label_dir}\n")
         f.write(f"PSEUDO_FOLDS: {args.pseudo_folds}\n")
+        f.write(f"PSEUDO_MASK_WATER: {args.pseudo_mask_water}\n")
         f.write(f"PATCH_STEM_VERSION: {args.patch_stem_version}\n")
         f.write(f"XATTN_HEADS: {args.xattn_heads}\n")
         f.write(f"PATCH_ROUTING: {args.patch_routing}\n")
@@ -1043,10 +1048,12 @@ def train_7a(args):
                 break
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
             target = batch["target"]
+            pseudo_mask = batch.pop("is_pseudo", None)  # (B,) 1=pseudo tile
             optimizer.zero_grad()
             with amp_ctx():
                 out = model(batch)
-                per_task = criterion(out, target)
+                per_task = criterion(out, target,
+                                     pseudo_mask=(pseudo_mask if args.pseudo_mask_water else None))
 
                 if use_gn:
                     balancer.step(per_task, ref_params)    # before model backward
