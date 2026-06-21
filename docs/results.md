@@ -1204,3 +1204,33 @@ flexnet, U-Net++ decoder (`--decoder unetpp --grad-checkpoint`), pixel-only (alp
 **Next (now justified):** (a) "room to grow" — extend epochs (60, T_max 60) + EMA decay 0.995 (the EMA proxy
 was still rising at ep40); (b) isolate U-Net++ vs EMA; (c) no-holdout + multi-seed ensemble of unetpp+EMA
 for the final. Best = `17_unetpp_ema_f1` 0.4521 rank 29. #1 = 0.5761 (gap 0.124).
+
+## Phase 17 — Exploratory single-knob screen on the unetpp+EMA base: NEGATIVE/FLAT (2026-06-21)
+
+### 50. None of 4 uncertain levers beats the unetpp+EMA base on fold 1 — base is locally optimal; task-weights actively hurts (IoU_W trade).
+OFAT screen, each cell = base (`17_unetpp_ema_f1`, internal fold-1 proxy 0.4891) + ONE change, cv-fold 1,
+bs16, unetpp+EMA+grad-checkpoint, 40 ep. Best-proxy epoch (ep40, EMA matured — compared at equal epoch):
+
+| cell | change | proxy | Δ vs base | IoU_B | IoU_W | RMSE_V |
+|------|--------|-------|-----------|-------|-------|--------|
+| base | — | 0.4891 | — | 0.360 | 0.716 | 3.35 |
+| 17e_vegh5 | veg-height-weight 3→5 | 0.4905 | +0.0014 | 0.355 | 0.739 | 3.34 |
+| 17e_blk2 | enc-blocks 1→2 (deeper) | 0.4886 | −0.0005 | 0.361 | 0.726 | 3.37 |
+| 17e_strata | --strata-aug (rare-class jitter) | 0.4814 | −0.0077 | 0.354 | 0.704 | 3.39 |
+| 17e_taskw | static-weights binary 1.70→2.50 | 0.4600 | −0.0291 | 0.363 | 0.530 | 3.37 |
+
+- **task-weights = conclusive NEGATIVE (−0.029, beyond the ~0.008 fold-noise floor).** Boosting the binary/
+  building objective gave the highest IoU_B (0.363) but **crashed IoU_W (0.716→0.530)** — the softmax-simplex
+  competition: pushing buildings steals from water. "Boost binary for IoU_B" is a trap. Dropped.
+- **strata-aug (−0.008), enc-blocks-2 (−0.0005): flat-to-slightly-negative, within noise.** Strata-adaptive
+  jitter didn't help; more encoder depth gives nothing over base → capacity saturated even at full data on the
+  U-Net++ base.
+- **veg-height-5 (+0.0014): only non-negative, but within noise** (RMSE_V tied at 3.34, not improved). Not a win.
+- **Verdict:** the `unetpp+EMA` recipe (default static-weights, enc-blocks 1, veg-weight 3, no strata-aug) is
+  **locally optimal** — single-knob tuning is exhausted. Matches the campaign's recurring "well-tuned base" pattern.
+- **Upside for the end-game:** blk2 and vegh5 are individually ≈base but reach it by *different routes* (depth vs
+  loss) → useful **ensemble diversity** members alongside multi-seed of the base.
+
+**Next (deadline ~2026-06-30):** deterministic end-game — no-holdout (all-fold) base/blk2/vegh5 + multi-seed,
+combined into a diverse **ensemble** for the final submission; one cheap uncertain squeeze = extended epochs
+(60, T_max 60; EMA was still rising at ep40). Best stays `17_unetpp_ema_f1` = 0.4521 rank 29.
