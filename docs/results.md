@@ -1234,3 +1234,25 @@ bs16, unetpp+EMA+grad-checkpoint, 40 ep. Best-proxy epoch (ep40, EMA matured —
 **Next (deadline ~2026-06-30):** deterministic end-game — no-holdout (all-fold) base/blk2/vegh5 + multi-seed,
 combined into a diverse **ensemble** for the final submission; one cheap uncertain squeeze = extended epochs
 (60, T_max 60; EMA was still rising at ep40). Best stays `17_unetpp_ema_f1` = 0.4521 rank 29.
+
+## Phase 18 — Single-task specialists on the unetpp+EMA base: WASH (2026-06-21)
+
+### 51. Specialization does NOT beat the multi-task base — interference is not the bottleneck.
+4 cells, cv-fold 1, unetpp+EMA+grad-checkpoint, bs16, 40 ep, via `--task {height,fraction}`. Read per-task
+(overall proxy meaningless — the untrained task's metric is garbage). Base = `17_unetpp_ema_f1`.
+
+| specialist | metric (vs base) | verdict |
+|------------|------------------|---------|
+| height (`--task height`) | RMSE_V 3.32 vs 3.35 (−0.03), RMSE_B 1.77 vs 1.74 (+0.03) | **wash** |
+| height + veg-weight 5 | RMSE_V 3.33 (≈base) | wash |
+| fraction (`--task fraction`) | IoU_B 0.364 / IoU_W 0.713 vs 0.360 / 0.716 | **wash** (within noise) |
+| fraction + strata-aug | IoU_W **0.747 (+0.031)**, IoU_B 0.357 (−0.003) | only IoU_W moves — the non-transferring metric |
+
+- **Isolating height gives no real RMSE_V gain** (3.32 vs 3.35; RMSE_B slightly worse) → multi-task
+  interference is NOT the height bottleneck; the shared decoder already extracts height ~as well as a specialist.
+- **Isolating fractions ≈ base on IoU** → no interference penalty to recover.
+- Only flicker: strata-aug → IoU_W +0.031 (on the fraction specialist), but IoU_W internal gains have never
+  transferred (mirage; cf. f43/f46/f50).
+- **Verdict:** specialization is a wash → closes the architecture/specialization line (f48→f50→f51). The leader
+  gap is not task interference. The remaining untried high-ceiling lever is **pseudo-labeling / self-training on
+  the target** (attacks the actual train→test transfer gap). Best stays `17_unetpp_ema_f1` = 0.4521 rank 29.
