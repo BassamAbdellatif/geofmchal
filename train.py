@@ -157,6 +157,9 @@ def parse_args():
     parser.add_argument("--ema-decay", type=float, default=0.999, help="EMA decay (default 0.999).")
     parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY,
                         help=f"AdamW weight decay (default {WEIGHT_DECAY}); raise for more regularization.")
+    parser.add_argument("--init-weights", type=str, default=None,
+                        help="[Phase 18] warm-start: load a checkpoint's weights before training "
+                             "(strict=False). For pseudo-label fine-tuning / specialist init.")
     parser.add_argument("--experiment-name", type=str, default=EXPERIMENT_NAME)
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     parser.add_argument("--patch-size", type=int, default=PATCH_SIZE)
@@ -270,6 +273,11 @@ def parse_args():
                         help="[Phase 17] strata-adaptive augmentation: scale domain-aug per coverage "
                              "stratum (rare-class/dense tiles get MORE jitter, empty get less) to fight "
                              "overfitting of oversampled rare tiles. Targets IoU_B/IoU_W.")
+    parser.add_argument("--pseudo-label-dir", type=str, default=None,
+                        help="[Phase 18] self-training: dir of pseudo-label tifs (real-label format). "
+                             "Tiles whose geo-fold is in --pseudo-folds load their TARGET from here.")
+    parser.add_argument("--pseudo-folds", type=str, default=None,
+                        help="[Phase 18] comma geo-folds whose tiles use pseudo-labels (train only).")
     parser.add_argument("--cache-dir", type=str, default=None,
                         help="[7A] Directory for the memmap float16 tile cache. If set, "
                              "tiles are preprocessed once and served from the (page-cached) "
@@ -856,6 +864,9 @@ def train_7a(args):
         f.write(f"EMA: {args.ema}\n")
         f.write(f"EMA_DECAY: {args.ema_decay}\n")
         f.write(f"WEIGHT_DECAY: {args.weight_decay}\n")
+        f.write(f"INIT_WEIGHTS: {args.init_weights}\n")
+        f.write(f"PSEUDO_LABEL_DIR: {args.pseudo_label_dir}\n")
+        f.write(f"PSEUDO_FOLDS: {args.pseudo_folds}\n")
         f.write(f"PATCH_STEM_VERSION: {args.patch_stem_version}\n")
         f.write(f"XATTN_HEADS: {args.xattn_heads}\n")
         f.write(f"PATCH_ROUTING: {args.patch_routing}\n")
@@ -893,11 +904,14 @@ def train_7a(args):
     tr_inc = [int(x) for x in args.train_folds.split(",")] if args.train_folds else None
     va_inc = [int(x) for x in args.val_folds.split(",")] if args.val_folds else None
     tiles = find_multimodal_train_tiles(DATA_ROOT_7A, use_thor=use_thor)
+    ps_folds = [int(x) for x in args.pseudo_folds.split(",")] if args.pseudo_folds else None
     train_ds = GeoFMDataset7A(tiles, is_train=True, cv_fold=args.cv_fold,
                               cache_dir=args.cache_dir, rebuild_cache=args.rebuild_cache,
                               patch_inputs=patch_names, include_folds=tr_inc,
                               domain_aug_scale=args.domain_aug_scale,
-                              strata_aug=args.strata_aug)
+                              strata_aug=args.strata_aug,
+                              pseudo_label_dir=args.pseudo_label_dir,
+                              pseudo_folds=ps_folds)
     if fast:
         val_ds = (GeoFMDataset7A(tiles, is_train=False, cache_dir=args.cache_dir,
                                  rebuild_cache=args.rebuild_cache, patch_inputs=patch_names,
@@ -962,6 +976,11 @@ def train_7a(args):
     model = model.to(device)
     print(f"   >> params: {sum(p.numel() for p in model.parameters())/1e6:.2f}M"
           f"  (height_bridge={'off' if args.no_height_bridge else 'on'})")
+    if args.init_weights:
+        _sd = torch.load(args.init_weights, map_location=device)
+        _miss, _unexp = model.load_state_dict(_sd, strict=False)
+        print(f"   >> init-weights warm-start from {args.init_weights} "
+              f"(missing={len(_miss)}, unexpected={len(_unexp)})")
 
     criterion = DualPathLoss(veg_height_boost=args.veg_height_boost,
                              use_binary=not args.no_binary_head,

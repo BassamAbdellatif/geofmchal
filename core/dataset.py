@@ -406,6 +406,8 @@ class GeoFMDataset7A(Dataset):
         include_folds=None,
         domain_aug_scale=1.0,
         strata_aug=False,
+        pseudo_label_dir=None,
+        pseudo_folds=None,
     ):
         # Active THOR patch streams (subset of thor_s1, thor_s2). When empty the
         # dataset behaves byte-identically to the pre-Phase-5D version: same cache
@@ -429,6 +431,18 @@ class GeoFMDataset7A(Dataset):
 
         self.is_train = is_train
         self.domain_aug_scale = domain_aug_scale  # [Phase 14] embedding domain-aug strength
+
+        # [Phase 18] pseudo-labeling: for tiles whose geo-fold is in pseudo_folds,
+        # replace the real target with a pseudo-label tif (same basename, in
+        # pseudo_label_dir). Embeddings still come from the cache; only the target
+        # is overridden in __getitem__. _is_pseudo is a per-tile mask over self.tiles.
+        self.pseudo_label_dir = pseudo_label_dir
+        self._pseudo_folds = set(pseudo_folds) if pseudo_folds else set()
+        if self.pseudo_label_dir and self._pseudo_folds:
+            self._is_pseudo = [folds.get(t["core_id"], -999) in self._pseudo_folds
+                               for t in self.tiles]
+        else:
+            self._is_pseudo = [False] * len(self.tiles)
         self.norm_stats = _load_norm_stats(norm_stats_path)
 
         # Per-instance cache spec: base modalities + any active THOR streams.
@@ -602,6 +616,17 @@ class GeoFMDataset7A(Dataset):
             scores.append(build + water)
         return scores
 
+    def _load_pseudo_target(self, tile):
+        """[Phase 18] Load a pseudo-label tif (same basename as the real label) from
+        pseudo_label_dir and process it identically to the real target: sanitize/pad +
+        height normalization clip(h/30, 0, 1.5). Returns (4,256,256) f32."""
+        path = os.path.join(self.pseudo_label_dir, os.path.basename(tile["label_path"]))
+        with rasterio.open(path) as src:
+            target = src.read().astype(np.float32)
+        target = _pad_to(np.nan_to_num(target))
+        target[3] = np.clip(target[3] / HEIGHT_NORM_CONSTANT, 0.0, 1.5)
+        return target
+
     def sampler_weights(self, weights=None):
         """
         Per-sample weights for WeightedRandomSampler.
@@ -658,6 +683,11 @@ class GeoFMDataset7A(Dataset):
             alpha, tessera = pp["alpha_earth"], pp["tessera"]
             tm_s1, tm_s2, target = pp["terramind_s1"], pp["terramind_s2"], pp["target"]
             thor = {n: pp[n] for n in self._thor_streams}
+
+        # [Phase 18] override the (cached real) target with the pseudo-label for
+        # pseudo-fold tiles. Embeddings are unchanged; only supervision differs.
+        if self._is_pseudo[idx]:
+            target = self._load_pseudo_target(tile)
 
         if self.is_train:
             emb_dict = {
