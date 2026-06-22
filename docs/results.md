@@ -1292,3 +1292,39 @@ Self-training screen via the **fold-1-as-target trick**: pseudo-label fold 1 wit
 - **Verdict:** naive pseudo-labeling is a dead end *as-is* — it attacks our single most valuable weak metric
   (IoU_W). Next: **rare-class-aware** variant = drop water-channel pseudo-supervision (per-sample mask; water
   learned from real folds only), keep building/veg/height pseudo. Best stays `17_unetpp_ema_f1` = 0.4521 rank 29.
+
+### 53. Rare-class-aware pseudo (water-loss masked) ALSO fails — softmax4 simplex coupling.
+`--pseudo-mask-water` drops the water MAE+dice supervision for pseudo tiles (water learned from {0,2,3,4}
+real only); building/veg/height keep pseudo. `18_pseudo_maskw_f1`, from-scratch, killed ep29/40 (verdict
+clear, head needed by other groups).
+
+| | proxy | IoU_B | IoU_W | RMSE_B | RMSE_V |
+|---|---|---|---|---|---|
+| base@ep28 | 0.4773 | 0.3573 | **0.651** | 1.765 | 3.339 |
+| maskw@ep28 | 0.4464 | 0.3616 | **0.512** | 1.858 | 3.445 |
+
+- **IoU_W still collapses (0.512, plateaued ep20→28 +0.005)** — masking water's *loss* is insufficient.
+  Root cause: in the **softmax4 4-way simplex** (building/veg/water/other), supervising the fold-1
+  **building+veg** pseudo-labels pushes softmax mass onto those channels and *starves water* even though
+  water's own loss term is masked. The coupling is through the shared simplex, not the loss weighting.
+- To truly protect water would need **height-only pseudo** (drop all 3 fraction pseudo channels) or a
+  non-simplex (sigmoid3) fraction head — but the pseudo line ceilings at *neutral on platform* regardless
+  (it targets IoU_W, the mirage), so not worth pursuing further.
+- **Verdict: pseudo-labeling / self-training is closed (f52+f53).** Naive taxes IoU_W; water-masking can't
+  undo it under softmax4. Best stays `17_unetpp_ema_f1` = 0.4521 rank 29.
+
+### 54. IoU_B building-loss sweep (cv-fold 1, full-data, 30ep) — only overlap-weight helps, marginally.
+3-node sweep vs base `17_unetpp_ema_f1` per-epoch log (free matched control). All recall-loss variants on
+the softmax4 building channel; anchor base@ep30 IoU_B=0.3581.
+
+| variant | IoU_B@ep30 vs base | IoU_W | note |
+|---|---|---|---|
+| `ftv07` (focal_tversky β0.7) | 0.3578 (−0.0003, flat) | 0.557 | no IoU_B lift; loses IoU_W (simplex) |
+| `ftv085` (focal_tversky β0.85) | ~0.354 (−0.004) | 0.584 | slightly hurts IoU_B |
+| `bow2` (building-overlap-weight 2.0) | 0.3639 @ep28 (**+0.0066**) | 0.577 | only mover, but ≈ noise floor (0.008) |
+
+- **Recall-weighting the building loss (focal-Tversky) does NOT fix building under-commitment** — IoU_B flat
+  or down. **Only raising the building-overlap *weight* (bow2) lifts IoU_B (+0.0066)**, at the single-fold
+  noise floor → suggestive, not decisive. All variants drop IoU_W via the softmax4 simplex competition.
+- **Next (if revisited):** confirm bow2 at full 40ep + push overlap-weight further (3.0); it's the lever that
+  moved the transferable metric. Deferred — nodes returned to other groups.
